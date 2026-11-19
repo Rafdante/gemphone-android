@@ -1,0 +1,10 @@
+{
+  "name": "gemphone-mcp-bridge",
+  "version": "1.0.0",
+  "description": "MCP Bridge for GemPhone (Android/Termux ADB & Clipboard)",
+  "main": "index.js",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^0.6.0"
+  }
+}
