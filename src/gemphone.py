@@ -748,6 +748,15 @@ _DESTRUCTIVE_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
     ("терминальный chmod/chown на /", re.compile(r"\bch(mod|own)\s+-R\s+[^\n]*\s/(\s|$)")),
     ("history wipe", re.compile(r"\brm\b[^\n]*(\.bash_history|\.zsh_history)")),
     ("poweroff/reboot через root", re.compile(r"\b(su\s+-c\s+)?(reboot|poweroff|halt)\b")),
+    # am start -d/--data с не-http схемой открывает диплинки (tel:, sms:,
+    # intent://, market:, системные настройки) в обход подтверждения open_url.
+    ("ADB intent с не-http схемой", re.compile(
+        r"\badb\b[^\n]*\bshell\b[^\n]*\b(am|monkey)\b[^\n]*"
+        r"(-d|--data|data)[ =]*(?!https?://)[a-z][a-z0-9+.-]*:"
+    )),
+    ("ADB intent с компонентом/flags", re.compile(
+        r"\badb\b[^\n]*\bshell\b[^\n]*\bam\s+start\b[^\n]*(-n\s|--component|-f\s|--flags|--user\s)"
+    )),
 )
 
 
