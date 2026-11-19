@@ -1,0 +1,23 @@
+# --- СЕКРЕТЫ (никогда не коммитим) ---
+.gemphone/
+config.json
+*hidden/config.json
+.env
+.env.*
+*.key
+*.pem
+api_keys*
+secrets*
+*.secret
+
+# --- личное / рантайм ---
+prompt_history.txt
+*.log
+*.tmp
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
