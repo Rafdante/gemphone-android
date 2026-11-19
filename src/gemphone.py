@@ -735,6 +735,31 @@ class PhoneNotifier:
 # ---------------------------------------------------------------------------
 
 
+# Деструктивные команды, которые run_command не выполняет даже после подтверждения.
+_DESTRUCTIVE_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
+    ("рекурсивное удаление корня/дома", re.compile(
+        r"\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)"
+        r"(/|/\*|~|~/|\$HOME)(\s|/|\*|$)"
+    )),
+    ("dd на устройство", re.compile(r"\bdd\b[^\n]*\bof=/dev/(block|sd|mmcblk|zero|sda)")),
+    ("fork bomb", re.compile(r":\(\)\s*\{\s*:\|:&\s*\}\s*;\s*:")),
+    ("форматирование/mkfs", re.compile(r"\bmkfs(\.[a-z0-9]+)?\b|\bmke2fs\b")),
+    ("перезапись диска", re.compile(r"\b(shred|wipefs)\b[^\n]*/dev/")),
+    ("терминальный chmod/chown на /", re.compile(r"\bch(mod|own)\s+-R\s+[^\n]*\s/(\s|$)")),
+    ("history wipe", re.compile(r"\brm\b[^\n]*(\.bash_history|\.zsh_history)")),
+    ("poweroff/reboot через root", re.compile(r"\b(su\s+-c\s+)?(reboot|poweroff|halt)\b")),
+)
+
+
+def detect_destructive_command(command: str) -> str | None:
+    """Возвращает описание сработавшего правила или None, если команда допустима."""
+    normalized = " ".join(command.split())
+    for label, pattern in _DESTRUCTIVE_PATTERNS:
+        if pattern.search(normalized):
+            return label
+    return None
+
+
 def truncate_text(text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
     if len(text) <= limit:
         return text
@@ -2675,8 +2700,20 @@ class AgentToolkit:
         package = str(args.get("package", "")).strip()
         query = str(args.get("query", "")).strip()
         url = str(args.get("url", "")).strip()
-        if action in ("launch", "stop", "open_url"):
-            ok, reason = self._confirm(f"ADB {action}: {package or url}", risk="moderate")
+        if action in ("launch", "stop"):
+            ok, reason = self._confirm(f"ADB {action}: {package}", risk="moderate")
+            if not ok:
+                return ToolExecutionResult({"rejected": reason})
+        elif action == "open_url":
+            # am start -a android.intent.action.VIEW -d <url> открывает не только
+            # веб-ссылки, но и диплинки (tel:, sms:, intent://), системные
+            # настройки и произвольные приложения -> считаем опасным.
+            scheme = url.split(":", 1)[0].lower() if ":" in url else ""
+            if scheme not in ("http", "https"):
+                return ToolExecutionResult(
+                    {"error": f"open_url разрешает только http/https (получено: {url or 'пусто'})."}
+                )
+            ok, reason = self._confirm(f"Открыть URL: {url}", risk="dangerous")
             if not ok:
                 return ToolExecutionResult({"rejected": reason})
         return ToolExecutionResult(self.phone.app_control(action, package=package, query=query, url=url))
@@ -2974,6 +3011,10 @@ class AgentToolkit:
         if not command:
             return ToolExecutionResult({"error": "Пустая команда."})
         timeout = max(1, min(int(args.get("timeout", DEFAULT_CMD_TIMEOUT)), 120))
+        blocked = detect_destructive_command(command)
+        if blocked:
+            self.ui.error(f"Заблокировано: {blocked}")
+            return ToolExecutionResult({"error": f"Команда отклонена политикой безопасности: {blocked}"})
         self.ui.panel("Команда", f"$ {command}", style="magenta")
         ok, reason = self._confirm("Выполнить в Termux?", risk="dangerous")
         if not ok:

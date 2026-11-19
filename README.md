@@ -17,14 +17,25 @@
 
 ## Установка
 
+Одной командой (клонирует репозиторий, ставит зависимости и кладёт
+`gemphone`/`gemcode` в `$PREFIX/bin`):
+
+```bash
+pkg install python git termux-api android-tools
+curl -fsSL https://raw.githubusercontent.com/Rafdante/gemphone-android/main/install.sh | bash
+```
+
+Вручную:
+
 ```bash
 pkg update
 pkg install python git termux-api android-tools
-pip install -r requirements.txt
-mkdir -p ~/bin
-cp src/gemphone.py src/gemcode.py ~/bin/
-chmod +x ~/bin/gemphone.py ~/bin/gemcode.py
+git clone https://github.com/Rafdante/gemphone-android.git ~/gemphone-android
+bash ~/gemphone-android/install.sh
 ```
+
+Внешние зависимости — опциональные (`httpx`, `prompt_toolkit`, `Pillow`, `rich`):
+без них GemPhone работает на stdlib `urllib` с упрощённым выводом.
 
 ## Настройка API-ключей
 
@@ -64,6 +75,10 @@ gemcode.py    # агент для работы с кодом
 - В коде нет захардкоженных ключей и токенов.
 - `.gitignore` исключает `config.json`, `.env*`, `*.key`, историю промптов.
 - Публикуя форк — не коммитьте свой `~/.gemphone/config.json`.
+- `run_command` блокирует деструктивные команды (`rm -rf /|~`, `dd of=/dev/*`,
+  fork bomb, `mkfs`, `wipefs`, `chmod -R ... /`, `reboot`) даже после подтверждения.
+- `adb_app_control open_url` считается **dangerous**: разрешены только `http(s)`,
+  внешние диплинки (`tel:`, `intent://`) отклоняются.
 
 ## Лицензия
 
