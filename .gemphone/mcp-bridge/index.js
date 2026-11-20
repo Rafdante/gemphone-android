@@ -4,12 +4,38 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
+
+// Все внешние команды запускаются через execFileSync с массивом аргументов:
+// shell не участвует, поэтому метасимволы из аргументов не выполняются.
+
+const MAX_TEXT_LENGTH = 4000;
+
+function requireText(value, name) {
+  if (typeof value !== "string") throw new Error(`${name} должен быть строкой`);
+  if (value.length > MAX_TEXT_LENGTH) throw new Error(`${name} слишком длинный`);
+  return value;
+}
+
+function requireCoord(value, name) {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0 || n > 100000) {
+    throw new Error(`${name} должен быть целым числом 0..100000`);
+  }
+  return n;
+}
+
+// adb shell склеивает аргументы и отдаёт строку на выполнение устройству (sh).
+// Поэтому текст оборачиваем в одинарные кавычки; пробелы кодируем как %s
+// (так работает `input text`), а одинарные кавычки экранируем.
+function deviceShellQuote(text) {
+  return "'" + text.replace(/ /g, "%s").replace(/'/g, `'\\''`) + "'";
+}
 
 const server = new Server(
   {
     name: "gemphone-mcp-bridge",
-    version: "1.0.0",
+    version: "1.0.1",
   },
   {
     capabilities: {
@@ -53,8 +79,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            x: { type: "number" },
-            y: { type: "number" }
+            x: { type: "integer", minimum: 0 },
+            y: { type: "integer", minimum: 0 }
           },
           required: ["x", "y"]
         }
@@ -75,31 +101,37 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  const { name, arguments: args = {} } = request.params;
   try {
     if (name === "phone_clipboard_get") {
-      const res = execSync("termux-clipboard-get").toString();
+      const res = execFileSync("termux-clipboard-get").toString();
       return { content: [{ type: "text", text: res }] };
     }
     if (name === "phone_clipboard_set") {
-      execSync(`termux-clipboard-set "${args.text}"`);
+      const text = requireText(args.text, "text");
+      // termux-clipboard-set читает текст из stdin — аргументы не нужны.
+      execFileSync("termux-clipboard-set", { input: text });
       return { content: [{ type: "text", text: "Clipboard set successfully" }] };
     }
     if (name === "phone_battery") {
-      const res = execSync("termux-battery-status").toString();
+      const res = execFileSync("termux-battery-status").toString();
       return { content: [{ type: "text", text: res }] };
     }
     if (name === "adb_screenshot") {
-      execSync("adb shell screencap -p /sdcard/screenshot.png && adb pull /sdcard/screenshot.png ./screenshot.png");
+      execFileSync("adb", ["shell", "screencap", "-p", "/sdcard/screenshot.png"]);
+      execFileSync("adb", ["pull", "/sdcard/screenshot.png", "./screenshot.png"]);
       return { content: [{ type: "text", text: "Screenshot saved to ./screenshot.png" }] };
     }
     if (name === "adb_tap") {
-      execSync(`adb shell input tap ${args.x} ${args.y}`);
-      return { content: [{ type: "text", text: `Tapped at ${args.x}, ${args.y}` }] };
+      const x = requireCoord(args.x, "x");
+      const y = requireCoord(args.y, "y");
+      execFileSync("adb", ["shell", "input", "tap", String(x), String(y)]);
+      return { content: [{ type: "text", text: `Tapped at ${x}, ${y}` }] };
     }
     if (name === "adb_type") {
-      execSync(`adb shell input text "${args.text}"`);
-      return { content: [{ type: "text", text: `Typed: ${args.text}` }] };
+      const text = requireText(args.text, "text");
+      execFileSync("adb", ["shell", `input text ${deviceShellQuote(text)}`]);
+      return { content: [{ type: "text", text: `Typed: ${text}` }] };
     }
     throw new Error(`Unknown tool: ${name}`);
   } catch (error) {

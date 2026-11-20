@@ -35,6 +35,8 @@ from typing import Any, Final
 import urllib.error
 import urllib.request
 
+from safety import detect_destructive_command
+
 # Подключаем readline для удобной истории ввода и стрелок в терминале, если доступен
 try:
     import readline  # noqa: F401
@@ -846,6 +848,10 @@ class WorkspaceToolkit:
             return {"error": "Параметр command не может быть пустым."}
 
         timeout = max(1, min(int(args.get("timeout", DEFAULT_CMD_TIMEOUT)), 120))
+
+        blocked = detect_destructive_command(command)
+        if blocked:
+            return {"error": f"Команда отклонена политикой безопасности: {blocked}"}
 
         print(self.theme.dim("-" * terminal_width()))
         print(self.theme.bold("Запуск команды:"))

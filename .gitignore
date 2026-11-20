@@ -1,5 +1,6 @@
 # --- СЕКРЕТЫ (никогда не коммитим) ---
-.gemphone/
+# Конфиг с ключами живёт в ~/.gemphone; сам каталог .gemphone/ в репозитории нужен (mcp-bridge)
+.gemphone/config.json
 config.json
 *hidden/config.json
 .env

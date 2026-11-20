@@ -32,9 +32,13 @@ install_launcher() {  # $1 = имя, $2 = файл в src/
 install_launcher gemphone gemphone.py
 install_launcher gemcode  gemcode.py
 
-if [ ! -f "$SRC_DIR/config.json" ]; then
-    cp "$SRC_DIR/config.example.json" "$SRC_DIR/config.json"
-    echo "==> Создан config.json из примера — впиши API-ключи (или задай GEMINI_API_KEY и т.п.)"
+# Приложение читает конфиг из ~/.gemphone/config.json (вне репозитория).
+CFG_DIR="$HOME/.gemphone"
+CFG_FILE="$CFG_DIR/config.json"
+if [ ! -f "$CFG_FILE" ]; then
+    mkdir -p "$CFG_DIR"
+    (umask 077 && cp "$SRC_DIR/config.example.json" "$CFG_FILE")
+    echo "==> Создан $CFG_FILE из примера — впиши API-ключи (или задай GEMINI_API_KEY и т.п.)"
 fi
 
 echo

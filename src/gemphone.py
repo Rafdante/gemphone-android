@@ -39,7 +39,10 @@ import threading
 import time
 from typing import Any, Final, Literal
 import urllib.error
+import urllib.parse
 import urllib.request
+
+from safety import check_fetch_url, detect_destructive_command, write_private
 import xml.etree.ElementTree as ET
 
 # ---------------------------------------------------------------------------
@@ -735,40 +738,6 @@ class PhoneNotifier:
 # ---------------------------------------------------------------------------
 
 
-# Деструктивные команды, которые run_command не выполняет даже после подтверждения.
-_DESTRUCTIVE_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
-    ("рекурсивное удаление корня/дома", re.compile(
-        r"\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)"
-        r"(/|/\*|~|~/|\$HOME)(\s|/|\*|$)"
-    )),
-    ("dd на устройство", re.compile(r"\bdd\b[^\n]*\bof=/dev/(block|sd|mmcblk|zero|sda)")),
-    ("fork bomb", re.compile(r":\(\)\s*\{\s*:\|:&\s*\}\s*;\s*:")),
-    ("форматирование/mkfs", re.compile(r"\bmkfs(\.[a-z0-9]+)?\b|\bmke2fs\b")),
-    ("перезапись диска", re.compile(r"\b(shred|wipefs)\b[^\n]*/dev/")),
-    ("терминальный chmod/chown на /", re.compile(r"\bch(mod|own)\s+-R\s+[^\n]*\s/(\s|$)")),
-    ("history wipe", re.compile(r"\brm\b[^\n]*(\.bash_history|\.zsh_history)")),
-    ("poweroff/reboot через root", re.compile(r"\b(su\s+-c\s+)?(reboot|poweroff|halt)\b")),
-    # am start -d/--data с не-http схемой открывает диплинки (tel:, sms:,
-    # intent://, market:, системные настройки) в обход подтверждения open_url.
-    ("ADB intent с не-http схемой", re.compile(
-        r"\badb\b[^\n]*\bshell\b[^\n]*\b(am|monkey)\b[^\n]*"
-        r"(-d|--data|data)[ =]*(?!https?://)[a-z][a-z0-9+.-]*:"
-    )),
-    ("ADB intent с компонентом/flags", re.compile(
-        r"\badb\b[^\n]*\bshell\b[^\n]*\bam\s+start\b[^\n]*(-n\s|--component|-f\s|--flags|--user\s)"
-    )),
-)
-
-
-def detect_destructive_command(command: str) -> str | None:
-    """Возвращает описание сработавшего правила или None, если команда допустима."""
-    normalized = " ".join(command.split())
-    for label, pattern in _DESTRUCTIVE_PATTERNS:
-        if pattern.search(normalized):
-            return label
-    return None
-
-
 def truncate_text(text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
     if len(text) <= limit:
         return text
@@ -952,16 +921,9 @@ class ConfigStore:
         }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            try:
-                os.chmod(self.path, 0o600)
-            except OSError:
-                pass
-        except OSError:
-            pass
+            write_private(self.path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        except OSError as exc:
+            print(f"Предупреждение: не удалось сохранить {self.path}: {exc}", file=sys.stderr)
 
     def get(self, name: str) -> ProviderConfig | None:
         return self.providers.get(name)
@@ -996,12 +958,9 @@ class MemoryStore:
     def save(self) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
-                json.dumps(self.data, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
+            write_private(self.path, json.dumps(self.data, ensure_ascii=False, indent=2) + "\n")
+        except OSError as exc:
+            print(f"Предупреждение: не удалось сохранить {self.path}: {exc}", file=sys.stderr)
 
     def set(self, key: str, value: str) -> None:
         self.data[key.strip()] = value.strip()
@@ -1218,18 +1177,47 @@ def _http_post_json_sync(
     raise ApiError(f"Не удалось выполнить запрос: {last_error}")
 
 
-def _http_get_text(url: str, timeout: int = 20) -> tuple[int, str, str]:
-    headers = {"User-Agent": HTTP_USER_AGENT}
-    if HAS_HTTPX and httpx is not None:
-        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-            resp = client.get(url, headers=headers)
-            return resp.status_code, resp.headers.get("content-type", ""), resp.text
+MAX_REDIRECTS: Final[int] = 5
+_REDIRECT_CODES: Final[tuple[int, ...]] = (301, 302, 303, 307, 308)
 
-    req = urllib.request.Request(url=url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        ctype = resp.headers.get("Content-Type", "")
-        raw = resp.read(512_000).decode("utf-8", errors="replace")
-        return resp.status, ctype, raw
+
+class _NoAutoRedirect(urllib.request.HTTPRedirectHandler):
+    """Редиректы обрабатываем сами, чтобы каждый шаг прошёл check_fetch_url."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+def _http_get_text(url: str, timeout: int = 20) -> tuple[int, str, str]:
+    """GET с проверкой каждого URL в цепочке редиректов. Бросает ValueError при отказе."""
+    headers = {"User-Agent": HTTP_USER_AGENT}
+    for _ in range(MAX_REDIRECTS + 1):
+        reason = check_fetch_url(url)
+        if reason:
+            raise ValueError(f"URL отклонён: {reason}")
+
+        if HAS_HTTPX and httpx is not None:
+            with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+                resp = client.get(url, headers=headers)
+                status, ctype = resp.status_code, resp.headers.get("content-type", "")
+                location, body = resp.headers.get("location"), resp.text
+        else:
+            opener = urllib.request.build_opener(_NoAutoRedirect)
+            req = urllib.request.Request(url=url, headers=headers)
+            try:
+                with opener.open(req, timeout=timeout) as resp:
+                    status, ctype = resp.status, resp.headers.get("Content-Type", "")
+                    location = None
+                    body = resp.read(512_000).decode("utf-8", errors="replace")
+            except urllib.error.HTTPError as exc:
+                status, ctype = exc.code, exc.headers.get("Content-Type", "")
+                location, body = exc.headers.get("Location"), ""
+
+        if status in _REDIRECT_CODES and location:
+            url = urllib.parse.urljoin(url, location)
+            continue
+        return status, ctype, body
+    raise ValueError("Слишком много редиректов.")
 
 
 class BaseLLMClient(ABC):
@@ -3045,7 +3033,18 @@ class AgentToolkit:
         url = str(args.get("url", "")).strip()
         if not url.startswith(("http://", "https://")):
             return ToolExecutionResult({"error": "Нужен http:// или https://"})
-        status, ctype, body = _http_get_text(url)
+        reason = check_fetch_url(url)
+        if reason:
+            return ToolExecutionResult({"error": f"URL отклонён: {reason}"})
+        ok, reason = self._confirm(
+            f"Загрузить URL (ссылка может передать данные наружу): {url}", risk="dangerous"
+        )
+        if not ok:
+            return ToolExecutionResult({"rejected": reason})
+        try:
+            status, ctype, body = _http_get_text(url)
+        except ValueError as exc:
+            return ToolExecutionResult({"error": str(exc)})
         if "html" in ctype.lower():
             parser = _HtmlTextExtractor()
             parser.feed(body)
@@ -3644,7 +3643,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-m", "--model", default=None, help="ID модели.")
     parser.add_argument("--mode", choices=("all", "phone", "code", "chat"), default="all", help="Набор инструментов.")
     parser.add_argument("--budget", type=int, default=DEFAULT_TURN_TOKEN_BUDGET, help="Лимит токенов на 1 запрос.")
-    parser.add_argument("--api-key", default=None, help="API-ключ.")
+    parser.add_argument(
+        "--api-key", default=None,
+        help="API-ключ (небезопасно: виден в истории shell и в ps; лучше переменная окружения).",
+    )
     parser.add_argument("--adb-serial", default=None, help="Serial устройства ADB.")
     parser.add_argument("-p", "--prompt", default=None, help="Одноразовый запрос.")
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS, help="Максимум шагов (по умолч. 10).")
