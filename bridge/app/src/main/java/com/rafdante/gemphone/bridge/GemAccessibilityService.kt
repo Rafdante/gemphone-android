@@ -42,12 +42,31 @@ class GemAccessibilityService : AccessibilityService() {
             return rotateToken(context)
         }
 
+        /** Дублируем токен в Download, чтобы Termux мог его прочитать. */
+        private fun mirrorToken(context: Context, token: String) {
+            try {
+                val values = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, "gemphone_bridge_token.txt")
+                    put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                    put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH,
+                        android.os.Environment.DIRECTORY_DOWNLOADS)
+                }
+                val resolver = context.contentResolver
+                val uri = resolver.insert(
+                    android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return
+                resolver.openOutputStream(uri)?.use { it.write(token.toByteArray()) }
+            } catch (e: Exception) {
+                android.util.Log.w("GemBridge", "mirrorToken: ${e.message}")
+            }
+        }
+
         fun rotateToken(context: Context): String {
             val bytes = ByteArray(24)
             SecureRandom().nextBytes(bytes)
             val token = bytes.joinToString("") { "%02x".format(it) }
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .edit().putString(KEY_TOKEN, token).apply()
+            mirrorToken(context, token)
             return token
         }
     }
@@ -58,7 +77,7 @@ class GemAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
-        getOrCreateToken(this)
+        mirrorToken(this, getOrCreateToken(this))
         server = LocalHttpServer(this, port = 7331, tokenProvider = { getOrCreateToken(this) })
         server?.start()
     }
