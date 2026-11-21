@@ -15,8 +15,13 @@ class LocalHttpServer(
     private val tokenProvider: () -> String,
 ) {
     @Volatile private var running = false
-    private var serverSocket: ServerSocket? = null
+    @Volatile private var serverSocket: ServerSocket? = null
     private val pool = Executors.newCachedThreadPool()
+    @Volatile var lastError: String? = null
+        private set
+
+    /** true, если сокет реально слушает порт. */
+    fun isListening(): Boolean = serverSocket?.isBound == true && running
 
     fun start() {
         if (running) return
@@ -28,7 +33,16 @@ class LocalHttpServer(
                     val client = serverSocket?.accept() ?: break
                     pool.execute { handleClient(client) }
                 }
-            } catch (_: Exception) {
+            } catch (e: java.net.BindException) {
+                lastError = "порт ${port} занят (${e.message})"
+                running = false
+                serverSocket = null
+                android.util.Log.e("GemPhoneBridge", "HTTP bind failed: $lastError")
+            } catch (e: Exception) {
+                lastError = "${e.javaClass.simpleName}: ${e.message}"
+                running = false
+                serverSocket = null
+                android.util.Log.e("GemPhoneBridge", "HTTP server stopped: $lastError")
             }
         }
     }
@@ -90,6 +104,8 @@ class LocalHttpServer(
                             put("width", w)
                             put("height", h)
                             put("app", service.currentApp())
+                            put("port_bound", isListening())
+                            lastError?.let { put("server_error", it) }
                         })
                     }
                     method == "GET" && path == "/ui" -> {
@@ -118,8 +134,11 @@ class LocalHttpServer(
                         writeJson(output, 200, JSONObject().put("ok", ok))
                     }
                     method == "POST" && path == "/type" -> {
-                        val ok = service.performTypeText(body.optString("text"), body.optBoolean("press_enter", false))
-                        writeJson(output, 200, JSONObject().put("ok", ok))
+                        val res = service.performTypeText(body.optString("text"), body.optBoolean("press_enter", false))
+                        val out = JSONObject().put("ok", res.ok)
+                        if (res.warnings.isNotEmpty()) out.put("warnings", org.json.JSONArray(res.warnings))
+                        if (res.reason != null) out.put("reason", res.reason)
+                        writeJson(output, 200, out)
                     }
                     method == "POST" && path == "/key" -> {
                         val ok = service.performKey(body.optString("key"))

@@ -80,9 +80,23 @@ class MainActivity : Activity() {
     }
 
     private fun refreshUi() {
-        val active = GemAccessibilityService.instance != null
-        statusView.text = if (active) "● Сервис активен (127.0.0.1:7331)" else "○ Сервис выключен — включи ниже"
-        statusView.setTextColor(if (active) Color.parseColor("#4ADE80") else Color.parseColor("#FACC15"))
+        val inst = GemAccessibilityService.instance
+        val active = inst != null
+        val listening = active && (inst!!.httpServer?.isListening() == true)
+        val err = inst?.httpServer?.lastError
+        statusView.text = when {
+            listening -> "● Сервис активен (127.0.0.1:7331)"
+            active && err != null -> "⚠ Сервис включён, но порт не слушается: $err"
+            active -> "● Сервис активен (ожидание порта…)"
+            else -> "○ Сервис выключен — включи ниже"
+        }
+        statusView.setTextColor(
+            when {
+                listening -> Color.parseColor("#4ADE80")
+                active -> Color.parseColor("#FACC15")
+                else -> Color.parseColor("#FACC15")
+            }
+        )
         val tok = GemAccessibilityService.getOrCreateToken(this)
         tokenView.text = "Token: ${tok.take(8)}...${tok.takeLast(6)}"
     }

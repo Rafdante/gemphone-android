@@ -49,6 +49,7 @@ class GemAccessibilityService : AccessibilityService() {
     }
 
     private var server: LocalHttpServer? = null
+    val httpServer: LocalHttpServer? get() = server
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -156,28 +157,53 @@ class GemAccessibilityService : AccessibilityService() {
         return ok
     }
 
-    fun performTypeText(text: String, pressEnter: Boolean): Boolean {
-        val root = rootInActiveWindow ?: return false
-        val target = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: findFirstEditable(root) ?: return false
-        val args = Bundle().apply {
-            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+    fun performTypeText(text: String, pressEnter: Boolean): TypeResult {
+        val pairs = mutableListOf<Pair<AccessibilityNodeInfo, Boolean>>()
+        for (win in windows) {
+            val root = win.root ?: continue
+            val focused = win.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+            collectEditables(root, pairs, rootInActiveWindow?.windowId)
+            if (focused != null && focused.isEditable) pairs.add(0, focused to (focused.windowId == rootInActiveWindow?.windowId))
         }
-        val ok = target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-        if (ok && pressEnter && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            target.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+        if (pairs.isEmpty()) return TypeResult(false, listOf("окно без editable-поля (rootInActiveWindow=${rootInActiveWindow != null})"), "no editable field found")
+        if (rootInActiveWindow == null) return TypeResult(false, listOf("rootInActiveWindow = null"), "active window unavailable")
+
+        val errors = mutableListOf<String>()
+        for ((node, _inActive) in pairs) {
+            if (!supportsSetText(node)) { errors.add("field has no ACTION_SET_TEXT action"); continue }
+            val args = Bundle().apply {
+                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+            }
+            if (!node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+                errors.add("ACTION_SET_TEXT rejected")
+                continue
+            }
+            if (pressEnter) {
+                val enterOk = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                    node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                if (!enterOk) errors.add("enter not delivered")
+            }
+            return TypeResult(true, errors, null)
         }
-        return ok
+        return TypeResult(false, errors, "ACTION_SET_TEXT unsupported (custom/WebView field?)")
     }
 
-    private fun findFirstEditable(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
-        if (node == null) return null
-        if (node.isEditable) return node
-        for (i in 0 until node.childCount) {
-            val found = findFirstEditable(node.getChild(i))
-            if (found != null) return found
-        }
-        return null
+    private fun supportsSetText(node: AccessibilityNodeInfo): Boolean {
+        val actions = node.actionList ?: return node.isEditable
+        return actions.any { it.id == AccessibilityNodeInfo.ACTION_SET_TEXT }
     }
+
+    private fun collectEditables(
+        node: AccessibilityNodeInfo?,
+        out: MutableList<Pair<AccessibilityNodeInfo, Boolean>>,
+        activeWindowId: Int?,
+    ) {
+        if (node == null) return
+        if (node.isEditable) out.add(node to (activeWindowId != null && node.windowId == activeWindowId))
+        for (i in 0 until node.childCount) collectEditables(node.getChild(i), out, activeWindowId)
+    }
+
+    data class TypeResult(val ok: Boolean, val warnings: List<String>, val reason: String?)
 
     fun performKey(key: String): Boolean {
         val action = when (key.uppercase()) {
@@ -186,7 +212,7 @@ class GemAccessibilityService : AccessibilityService() {
             "RECENTS", "APP_SWITCH", "KEYCODE_APP_SWITCH" -> GLOBAL_ACTION_RECENTS
             "NOTIFICATIONS" -> GLOBAL_ACTION_NOTIFICATIONS
             "QUICK_SETTINGS" -> GLOBAL_ACTION_QUICK_SETTINGS
-            "POWER", "KEYCODE_POWER" -> GLOBAL_ACTION_POWER_DIALOG
+            "POWER", "POWER_DIALOG", "KEYCODE_POWER" -> GLOBAL_ACTION_POWER_DIALOG
             "LOCK" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) GLOBAL_ACTION_LOCK_SCREEN else return false
             else -> return false
         }
@@ -244,7 +270,11 @@ class GemAccessibilityService : AccessibilityService() {
                 JSONObject().put("ok", true).put("package", pkg)
             }
             "open_url" -> {
-                val url = body.optString("url")
+                val url = body.optString("url").trim()
+                val scheme = Uri.parse(url).scheme?.lowercase()
+                if (scheme != "http" && scheme != "https") {
+                    return JSONObject().put("ok", false).put("error", "Only http(s) URLs are allowed")
+                }
                 val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 startActivity(intent)
                 JSONObject().put("ok", true).put("url", url)

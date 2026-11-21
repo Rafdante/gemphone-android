@@ -3178,13 +3178,27 @@ class PhoneController:
         return {"ok": True, "via": "adb", "from": [x1, y1], "to": [x2, y2]}
 
     def type_text(self, text: str, *, press_enter: bool = False) -> dict[str, Any]:
+        bridge_error: str = ""
+        bridge_warnings: list[str] = []
         if self.has_bridge():
             try:
                 bres = self.bridge.type_text(text, press_enter=press_enter)
-                if bres.get("ok", True):
-                    return {"ok": True, "via": "bridge", "method": str(bres.get("method") or "accessibility"), "chars": len(text)}
-            except Exception:
-                pass
+                bridge_warnings = [str(w) for w in (bres.get("warnings") or [])]
+                if bres.get("ok", False):
+                    res = {"ok": True, "via": "bridge", "method": "accessibility", "chars": len(text)}
+                    if bridge_warnings:
+                        res["warnings"] = bridge_warnings
+                    return res
+                bridge_error = str(bres.get("reason") or "ACTION_SET_TEXT отклонён")
+            except Exception as exc:
+                bridge_error = f"bridge error: {exc}"
+
+        if bridge_error and (not self.has_adb() or self.active_adb_serial() is None):
+            raise RuntimeError(
+                f"Ввод текста не удался. Bridge: {bridge_error}. "
+                "ADB не подключён (нужен для фолбэка) — включите беспроводную отладку и /adb. "
+                "Если поле кастомное (WebView/Flutter), используйте adb_tap по полю + вставку из буфера."
+            )
 
         is_simple_ascii = bool(re.fullmatch(r"[A-Za-z0-9._:/@+-]+", text))
         method = "adb_input"
