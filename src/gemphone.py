@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-GemPhone — продвинутый мультипровайдерный ИИ-агент для полноценного управления
-Android-смартфоном из Termux (ADB + UI Automator + Vision + Termux:API + Код)
-с поддержкой подписок (Claude Pro/Max, Gemini Pro, ChatGPT Plus/Pro через OAuth CLI),
-жёстким режимом экономии токенов (Token-Saver) и чётким Vision.
+GemPhone 3.8.1 — мультипровайдерный ИИ-агент для полноценного управления
+Android-смартфоном из Termux (AccessibilityService Bridge + ADB + UI Automator +
+Vision + Termux:API + Код) с интерфейсом в стиле Claude Code.
 """
 
 from __future__ import annotations
@@ -16,6 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 import difflib
 import getpass
+from html import escape as html_escape
 from html.parser import HTMLParser
 import io
 import json
@@ -41,6 +41,7 @@ import threading
 import time
 from typing import Any, Final, Literal
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
@@ -67,29 +68,38 @@ except ImportError:
 
 try:
     from prompt_toolkit import PromptSession  # type: ignore[import-not-found]
-    from prompt_toolkit.completion import WordCompleter  # type: ignore[import-not-found]
+    from prompt_toolkit.completion import Completer, Completion  # type: ignore[import-not-found]
+    from prompt_toolkit.formatted_text import HTML  # type: ignore[import-not-found]
     from prompt_toolkit.history import FileHistory  # type: ignore[import-not-found]
+    from prompt_toolkit.styles import Style as PTStyle  # type: ignore[import-not-found]
 
     HAS_PROMPT_TOOLKIT = True
 except ImportError:
     PromptSession = None  # type: ignore[assignment]
-    WordCompleter = None  # type: ignore[assignment]
+    Completer = object  # type: ignore[assignment,misc]
+    Completion = None  # type: ignore[assignment]
+    HTML = None  # type: ignore[assignment]
     FileHistory = None  # type: ignore[assignment]
+    PTStyle = None  # type: ignore[assignment]
     HAS_PROMPT_TOOLKIT = False
 
 try:
     from rich.console import Console  # type: ignore[import-not-found]
+    from rich.live import Live  # type: ignore[import-not-found]
     from rich.markdown import Markdown  # type: ignore[import-not-found]
     from rich.markup import escape as rich_escape  # type: ignore[import-not-found]
     from rich.panel import Panel  # type: ignore[import-not-found]
     from rich.table import Table  # type: ignore[import-not-found]
+    from rich.text import Text  # type: ignore[import-not-found]
 
     HAS_RICH = True
 except ImportError:
     Console = None  # type: ignore[assignment]
+    Live = None  # type: ignore[assignment]
     Markdown = None  # type: ignore[assignment]
     Panel = None  # type: ignore[assignment]
     Table = None  # type: ignore[assignment]
+    Text = None  # type: ignore[assignment]
     HAS_RICH = False
 
     def rich_escape(text: str) -> str:
@@ -103,8 +113,11 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Константы, лимиты экономии токенов и пресеты провайдеров
+# Константы, палитра Claude Code, лимиты и пресеты провайдеров
 # ---------------------------------------------------------------------------
+
+APP_VERSION: Final[str] = "3.8.1"
+ACCENT: Final[str] = "#D97757"  # Фирменный тёплый терракотовый акцент в стиле Claude Code
 
 APP_DIR: Final[Path] = Path.home() / ".gemphone"
 CONFIG_PATH: Final[Path] = APP_DIR / "config.json"
@@ -113,6 +126,12 @@ MEMORY_PATH: Final[Path] = APP_DIR / "memory.json"
 SESSIONS_DIR: Final[Path] = APP_DIR / "sessions"
 HISTORY_PATH: Final[Path] = APP_DIR / "prompt_history.txt"
 LAST_SCREENSHOT_PATH: Final[Path] = APP_DIR / "last_screen.jpg"
+CANCEL_FLAG_PATH: Final[Path] = APP_DIR / "cancel.flag"
+BRIDGE_TOKEN_PATH: Final[Path] = APP_DIR / "bridge.token"
+
+BRIDGE_DEFAULT_HOST: Final[str] = "127.0.0.1"
+BRIDGE_DEFAULT_PORT: Final[int] = 7331
+ADB_CACHE_TTL_SEC: Final[float] = 10.0
 
 DEFAULT_PROVIDER: Final[str] = "gemini"
 DEFAULT_MAX_STEPS: Final[int] = 10
@@ -125,28 +144,67 @@ MAX_READ_LINES: Final[int] = 150
 SCREENSHOT_MAX_DIM: Final[int] = 1280
 SCREENSHOT_HQ_MAX_DIM: Final[int] = 1920
 SCREENSHOT_JPEG_QUALITY: Final[int] = 85
-APP_VERSION: Final[str] = "3.8.1"
 HTTP_USER_AGENT: Final[str] = f"GemPhone/{APP_VERSION} (Android; Termux)"
-CANCEL_FLAG_PATH: Final[Path] = APP_DIR / "cancel.flag"
-BRIDGE_TOKEN_PATH: Final[Path] = APP_DIR / "bridge.token"
-DEFAULT_BRIDGE_URL: Final[str] = "http://127.0.0.1:7331"
 
 RiskLevel = Literal["safe", "moderate", "dangerous"]
 ToolMode = Literal["all", "phone", "code", "chat"]
 
+SLASH_COMMANDS_META: Final[list[tuple[str, str]]] = [
+    ("/help", "список всех команд"),
+    ("/providers", "провайдеры API и подписки"),
+    ("/use", "переключить нейросеть (/use <имя>)"),
+    ("/login", "войти по подписке (gemini-sub, claude-sub, chatgpt-sub)"),
+    ("/model", "сменить модель (/model <id>)"),
+    ("/mode", "профиль инструментов: all | phone | code | chat"),
+    ("/quality", "чёткость скриншотов: eco | normal | hd"),
+    ("/budget", "лимит токенов на запрос (/budget 60k)"),
+    ("/steps", "лимит шагов на запрос (/steps 25)"),
+    ("/bridge", "статус и токен AccessibilityService Bridge"),
+    ("/adb", "мастер подключения беспроводной отладки ADB"),
+    ("/screen", "показать элементы текущего экрана"),
+    ("/status", "диагностика модулей и настроек"),
+    ("/notify", "оповещения Android: on | off | tts | test"),
+    ("/key", "задать API-ключ для провайдера"),
+    ("/add", "добавить свой API или CLI-подписку"),
+    ("/vision", "вкл/выкл отправку скриншотов"),
+    ("/auto", "вкл/выкл автоподтверждение действий"),
+    ("/memory", "долгосрочная память агента"),
+    ("/save", "сохранить диалог"),
+    ("/load", "загрузить диалог"),
+    ("/tokens", "расход токенов за сессию"),
+    ("/clear", "очистить историю диалога"),
+    ("/exit", "выход из GemPhone"),
+]
+
+TOOL_DISPLAY_NAMES: Final[dict[str, str]] = {
+    "adb_status": "PhoneStatus",
+    "adb_ui_dump": "UIDump",
+    "adb_screenshot": "Screenshot",
+    "adb_tap": "Tap",
+    "adb_swipe": "Swipe",
+    "adb_type_text": "Type",
+    "adb_keyevent": "Key",
+    "adb_app_control": "App",
+    "phone_sensors": "Sensors",
+    "phone_controls": "Control",
+    "phone_notifications": "Notify",
+    "phone_clipboard": "Clipboard",
+    "phone_comms": "Comms",
+    "phone_media": "Media",
+    "list_files": "List",
+    "read_file": "Read",
+    "search_text": "Search",
+    "edit_file": "Edit",
+    "write_file": "Write",
+    "run_command": "Run",
+    "web_fetch": "Fetch",
+    "memory": "Memory",
+}
+
 SUBSCRIPTION_INSTALL_HINTS: Final[dict[str, tuple[str, str]]] = {
-    "claude-sub": (
-        "npm install -g @anthropic-ai/claude-code",
-        "claude login",
-    ),
-    "gemini-sub": (
-        "npm install -g @google/gemini-cli",
-        "gemini",
-    ),
-    "chatgpt-sub": (
-        "npm install -g @openai/codex",
-        "codex login",
-    ),
+    "claude-sub": ("npm install -g @anthropic-ai/claude-code", "claude login"),
+    "gemini-sub": ("npm install -g @google/gemini-cli", "gemini"),
+    "chatgpt-sub": ("npm install -g @openai/codex", "codex login"),
 }
 
 PROVIDER_PRESETS: Final[dict[str, dict[str, Any]]] = {
@@ -168,7 +226,7 @@ PROVIDER_PRESETS: Final[dict[str, dict[str, Any]]] = {
         "env_var": "",
         "model": "default",
         "requires_key": False,
-        "supports_vision": True,
+        "supports_vision": False,
         "description": "Подписка Google / Gemini AI Pro (OAuth через Gemini CLI)",
     },
     "claude-sub": {
@@ -179,7 +237,7 @@ PROVIDER_PRESETS: Final[dict[str, dict[str, Any]]] = {
         "env_var": "",
         "model": "default",
         "requires_key": False,
-        "supports_vision": True,
+        "supports_vision": False,
         "description": "Подписка Claude Pro / Max (OAuth через Claude Code CLI)",
     },
     "chatgpt-sub": {
@@ -290,6 +348,13 @@ ANDROID_KEYEVENTS: Final[dict[str, str]] = {
     "NOTIFICATIONS": "KEYCODE_NOTIFICATION",
 }
 
+DANGEROUS_CMD_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\s+(/|~|\$HOME|\*)\b"),
+    re.compile(r"\b(mkfs|dd\s+if=|format\s+[a-zA-Z]:|diskpart)\b", re.IGNORECASE),
+    re.compile(r":\(\)\s*\{\s*:\|:&\s*\};:"),
+    re.compile(r"\b(shutdown|reboot|poweroff|init\s+0)\b", re.IGNORECASE),
+)
+
 IGNORED_DIRS: Final[frozenset[str]] = frozenset(
     {
         ".git",
@@ -316,83 +381,276 @@ SYSTEM_PROMPT: Final[str] = (
     "2. Reply concisely in the user's language (usually Russian). Do not repeat a failing action more than twice; "
     "if stuck, briefly explain why and ask.\n"
     "3. Prefer fast `phone_*` tools (Termux:API) for sensors, notifications, clipboard, SMS, calls, media.\n"
-    "4. For UI control via ADB: call `adb_ui_dump` first, then `adb_tap(element_id=...)`. "
-    "Use `adb_screenshot` when visual inspection or reading on-screen text is needed (pass `hq=true` for fine print).\n"
+    "4. For UI control: call `adb_ui_dump` first, then `adb_tap(element_id=...)` (works via AccessibilityService Bridge "
+    "without ADB or via ADB). Use `adb_screenshot` when visual inspection is needed (pass `hq=true` for fine print).\n"
     "5. Read on-screen text carefully and literally; never guess or fabricate words that are unclear.\n"
-    "6. If ADB is not connected, tell the user to run `/adb`."
+    "6. If neither AccessibilityService Bridge nor ADB is connected, tell the user to enable GemPhone Bridge in Accessibility "
+    "or run `/adb`."
 )
 
 
 # ---------------------------------------------------------------------------
-# Терминальный интерфейс (Rich + ANSI-fallback)
+# Терминальный интерфейс в стиле Claude Code (Rich + PromptToolkit)
 # ---------------------------------------------------------------------------
 
 
-class _FallbackSpinner:
-    _FRAMES: Final[tuple[str, ...]] = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+class _SlashCompleter(Completer):  # type: ignore[misc]
+    """Автодополнение slash-команд с описаниями прямо над клавиатурой."""
 
-    def __init__(self, message: str) -> None:
-        self._message = message
+    def get_completions(self, document: Any, _complete_event: Any) -> Any:
+        if not HAS_PROMPT_TOOLKIT or Completion is None:
+            return
+        text = document.text_before_cursor.lstrip()
+        if not text.startswith("/") or " " in text:
+            return
+        for cmd, desc in SLASH_COMMANDS_META:
+            if cmd.startswith(text.lower()):
+                yield Completion(cmd, start_position=-len(text), display=cmd, display_meta=desc)
+
+
+class _ThinkingSpinner:
+    """Живой индикатор в стиле Claude Code: ✻ Думаю… (2.4s · шаг 1/10 · esc — отмена)."""
+
+    _GLYPHS: Final[tuple[str, ...]] = ("✻", "✽", "✶", "✢", "·", "✢", "✶", "✽")
+
+    def __init__(self, ui: ConsoleUI, label: str, sublabel: str = "") -> None:
+        self._ui = ui
+        self._label = label
+        self._sublabel = sublabel
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._active = bool(getattr(sys.stderr, "isatty", lambda: False)())
+        self._started = 0.0
+        self._live: Any = None
 
-    def __enter__(self) -> _FallbackSpinner:
-        if self._active:
-            self._thread = threading.Thread(target=self._run, daemon=True)
+    def _render_rich(self, idx: int) -> Any:
+        elapsed = time.perf_counter() - self._started
+        glyph = self._GLYPHS[idx % len(self._GLYPHS)]
+        t = Text()
+        t.append(f"{glyph} ", style=f"bold {ACCENT}")
+        t.append(self._label, style="bold white")
+        meta = f" ({elapsed:.1f}s"
+        if self._sublabel:
+            meta += f" · {self._sublabel}"
+        meta += " · esc — отмена)"
+        t.append(meta, style="dim")
+        return t
+
+    def __enter__(self) -> _ThinkingSpinner:
+        self._started = time.perf_counter()
+        if self._ui.rich_console is not None and Live is not None and Text is not None:
+            self._live = Live(
+                self._render_rich(0),
+                console=self._ui.rich_console,
+                refresh_per_second=8,
+                transient=True,
+            )
+            self._live.__enter__()
+            self._thread = threading.Thread(target=self._loop_rich, daemon=True)
+            self._thread.start()
+        elif sys.stderr.isatty():
+            self._thread = threading.Thread(target=self._loop_ansi, daemon=True)
             self._thread.start()
         return self
 
     def __exit__(self, *_exc: object) -> None:
-        if not self._active:
-            return
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=0.5)
-        sys.stderr.write("\r\033[K")
-        sys.stderr.flush()
+            self._thread.join(timeout=0.4)
+        if self._live is not None:
+            self._live.__exit__(None, None, None)
+            self._live = None
+        elif sys.stderr.isatty():
+            sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
 
-    def _run(self) -> None:
+    def _loop_rich(self) -> None:
         idx = 0
         while not self._stop.is_set():
-            frame = self._FRAMES[idx % len(self._FRAMES)]
-            sys.stderr.write(f"\r\033[K\033[2m{frame} {self._message}\033[0m")
+            if self._live is not None:
+                self._live.update(self._render_rich(idx))
+            idx += 1
+            self._stop.wait(0.14)
+
+    def _loop_ansi(self) -> None:
+        idx = 0
+        while not self._stop.is_set():
+            elapsed = time.perf_counter() - self._started
+            glyph = self._GLYPHS[idx % len(self._GLYPHS)]
+            sub = f" · {self._sublabel}" if self._sublabel else ""
+            sys.stderr.write(f"\r\033[K\033[33m{glyph}\033[0m {self._label} \033[2m({elapsed:.1f}s{sub})\033[0m")
             sys.stderr.flush()
             idx += 1
-            self._stop.wait(0.09)
+            self._stop.wait(0.14)
+
+
+class _RunningToolLine:
+    """Живая строка выполняющегося инструмента в стиле Claude Code (сворачивается в ● / ⎿)."""
+
+    _FRAMES: Final[tuple[str, ...]] = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+    def __init__(self, ui: ConsoleUI, name: str, args: dict[str, Any]) -> None:
+        self._ui = ui
+        self._display = TOOL_DISPLAY_NAMES.get(name, name)
+        self._arg_str = _format_tool_args(args)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._live: Any = None
+        self._started = 0.0
+
+    def _render(self, idx: int) -> Any:
+        frame = self._FRAMES[idx % len(self._FRAMES)]
+        elapsed = time.perf_counter() - self._started
+        if Text is not None:
+            t = Text()
+            t.append(f"{frame} ", style=f"bold {ACCENT}")
+            t.append(self._display, style="bold")
+            t.append(f"({self._arg_str})", style="dim")
+            if elapsed >= 0.4:
+                t.append(f"  {elapsed:.1f}s", style="dim")
+            return t
+        return f"{frame} {self._display}({self._arg_str})"
+
+    def __enter__(self) -> _RunningToolLine:
+        self._started = time.perf_counter()
+        if self._ui.rich_console is not None and Live is not None:
+            self._live = Live(
+                self._render(0),
+                console=self._ui.rich_console,
+                refresh_per_second=10,
+                transient=True,
+            )
+            self._live.__enter__()
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.3)
+        if self._live is not None:
+            self._live.__exit__(None, None, None)
+            self._live = None
+
+    def _loop(self) -> None:
+        idx = 0
+        while not self._stop.is_set():
+            if self._live is not None:
+                self._live.update(self._render(idx))
+            idx += 1
+            self._stop.wait(0.1)
+
+
+def _format_tool_args(args: dict[str, Any]) -> str:
+    items: list[str] = []
+    for k, v in args.items():
+        if k in ("content", "old_text", "new_text"):
+            items.append(f"{k}=…({len(str(v))} симв.)")
+            continue
+        s = str(v).replace("\n", " ")
+        if len(s) > 36:
+            s = f"{s[:33]}…"
+        items.append(f"{k}={s}" if len(args) > 1 else s)
+    return ", ".join(items)
+
+
+def _summarize_tool_result(name: str, payload: dict[str, Any], elapsed: float) -> tuple[str, str]:
+    """Возвращает (статус: ok|err|warn, краткая строка-итог для ветки ⎿)."""
+    if "error" in payload:
+        return "err", str(payload["error"])[:110]
+    if "rejected" in payload:
+        return "warn", f"Отклонено: {payload['rejected']}"
+
+    via = f" [{payload['via']}]" if payload.get("via") else ""
+
+    if name == "read_file":
+        return "ok", f"Прочитано {payload.get('range', '?')} из {payload.get('total', '?')} строк ({elapsed:.1f}s)"
+    if name == "list_files":
+        return "ok", f"Найдено элементов: {payload.get('count', 0)}"
+    if name == "search_text":
+        return "ok", f"Совпадений: {payload.get('count', 0)}"
+    if name in ("edit_file", "write_file"):
+        return "ok", f"Сохранено: {payload.get('path', '')}"
+    if name == "run_command":
+        code = payload.get("code", 0)
+        lines = len((payload.get("stdout") or "").splitlines())
+        st = "ok" if code == 0 else "err"
+        return st, f"exit {code} · {elapsed:.1f}s (вывод: {lines} стр.)"
+    if name == "adb_ui_dump":
+        lines = len((payload.get("ui") or "").splitlines())
+        return "ok", f"{payload.get('app', '?')} · {lines} элементов{via} ({elapsed:.1f}s)"
+    if name == "adb_screenshot":
+        return "ok", f"Скриншот {payload.get('dim', '?')} · {payload.get('kb', '?')} KB{via} ({elapsed:.1f}s)"
+    if name == "adb_tap":
+        lbl = f" «{payload['label']}»" if payload.get("label") else ""
+        return "ok", f"{payload.get('action', 'tap')}{lbl} @({payload.get('x')}, {payload.get('y')}){via}"
+    if name == "adb_swipe":
+        return "ok", f"Свайп {payload.get('from')} → {payload.get('to')}{via}"
+    if name == "adb_type_text":
+        return "ok", f"Введено {payload.get('chars', 0)} симв. ({payload.get('method', '')}{via})"
+    if name == "adb_keyevent":
+        return "ok", f"Нажата клавиша {payload.get('keycode', '')}{via}"
+    if name == "adb_app_control":
+        if "packages" in payload:
+            return "ok", f"Найдено приложений: {payload.get('count', 0)}"
+        return "ok", f"{payload.get('package') or payload.get('url') or payload.get('app') or 'OK'}{via}"
+    if name == "web_fetch":
+        return "ok", f"HTTP {payload.get('status', '?')} · {len(str(payload.get('content', '')))} симв."
+    if name == "memory":
+        return "ok", f"Записей в памяти: {len(payload.get('memory', {}))}" if "memory" in payload else "Память обновлена"
+
+    compact = json.dumps(payload, ensure_ascii=False)
+    if len(compact) > 90:
+        compact = compact[:87] + "…"
+    return "ok", compact
 
 
 class ConsoleUI:
-    """Единая обёртка терминального вывода."""
+    """Минималистичный UI в стиле Claude Code поверх Rich + ANSI."""
 
     def __init__(self) -> None:
         self.rich_console = Console() if HAS_RICH else None
-        self.ansi = bool(getattr(sys.stdout, "isatty", lambda: False)()) and os.environ.get("NO_COLOR") is None
+        self.ansi = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 
     def width(self) -> int:
         cols = shutil.get_terminal_size(fallback=(60, 24)).columns
         return max(34, min(cols, 84))
 
-    @contextmanager
-    def status(self, message: str) -> Any:
-        if self.rich_console is not None:
-            started = time.perf_counter()
-            stop_ev = threading.Event()
-            with self.rich_console.status(f"[cyan]✻ {rich_escape(message)}[/cyan]", spinner="dots") as st:
-                def _tick() -> None:
-                    while not stop_ev.wait(0.5):
-                        elapsed = time.perf_counter() - started
-                        st.update(f"[cyan]✻ {rich_escape(message)}[/cyan] [dim]· {elapsed:.1f}s[/dim]")
-                t = threading.Thread(target=_tick, daemon=True)
-                t.start()
-                try:
-                    yield st
-                finally:
-                    stop_ev.set()
-                    t.join(timeout=0.2)
+    def thinking(self, label: str, sublabel: str = "") -> _ThinkingSpinner:
+        return _ThinkingSpinner(self, label, sublabel)
+
+    def running_tool(self, name: str, args: dict[str, Any]) -> _RunningToolLine:
+        return _RunningToolLine(self, name, args)
+
+    def header_card(
+        self,
+        *,
+        provider: str,
+        model: str,
+        workspace: str,
+        transport_state: str,
+        mode: str,
+        tools_count: int,
+    ) -> None:
+        short_ws = workspace.replace(str(Path.home()), "~")
+        if self.rich_console is not None and Panel is not None:
+            body = (
+                f"[bold {ACCENT}]✻ GemPhone {APP_VERSION}[/]  [dim]·[/]  [bold]{rich_escape(provider)}[/] / {rich_escape(model)}\n"
+                f"  [dim]{rich_escape(short_ws)} · {rich_escape(transport_state)} · {mode} ({tools_count} инстр.)[/dim]\n"
+                f"  [dim]/help команды · /bridge мост · esc отмена[/dim]"
+            )
+            self.rich_console.print(Panel(body, border_style="bright_black", padding=(0, 1)))
             return
-        with _FallbackSpinner(message):
-            yield
+        print(f"✻ GemPhone {APP_VERSION} · {provider}/{model} | {short_ws} | {transport_state}")
+
+    def rule(self) -> None:
+        line = "─" * self.width()
+        if self.rich_console is not None:
+            self.rich_console.print(f"[bright_black]{line}[/bright_black]")
+        elif self.ansi:
+            print(f"\033[90m{line}\033[0m")
+        else:
+            print(line)
 
     def info(self, text: str) -> None:
         if self.rich_console is not None:
@@ -410,7 +668,7 @@ class ConsoleUI:
 
     def success(self, text: str) -> None:
         if self.rich_console is not None:
-            self.rich_console.print(f"[bold green]{rich_escape(text)}[/bold green]")
+            self.rich_console.print(f"[green]{rich_escape(text)}[/green]")
         elif self.ansi:
             print(f"\033[32m{text}\033[0m")
         else:
@@ -432,21 +690,29 @@ class ConsoleUI:
         else:
             print(text)
 
-    def panel(self, title: str, body: str, style: str = "cyan") -> None:
-        if self.rich_console is not None:
+    def panel(self, title: str, body: str, style: str = "bright_black") -> None:
+        if self.rich_console is not None and Panel is not None:
             self.rich_console.print(
-                Panel(rich_escape(body), title=f"[bold]{rich_escape(title)}[/bold]", border_style=style)
+                Panel(
+                    rich_escape(body),
+                    title=f"[bold {ACCENT}]{rich_escape(title)}[/]",
+                    title_align="left",
+                    border_style=style,
+                    padding=(0, 1),
+                )
             )
             return
-        sep = "-" * self.width()
-        print(sep)
-        print(f"[{title}]")
-        print(body)
-        print(sep)
+        sep = "─" * self.width()
+        print(f"{sep}\n[{title}]\n{body}\n{sep}")
 
     def table(self, title: str, headers: list[str], rows: list[list[str]]) -> None:
         if self.rich_console is not None and Table is not None:
-            tbl = Table(title=rich_escape(title), show_lines=False, header_style="bold cyan")
+            tbl = Table(
+                title=f"[bold]{rich_escape(title)}[/bold]",
+                show_lines=False,
+                border_style="bright_black",
+                header_style=f"bold {ACCENT}",
+            )
             for h in headers:
                 tbl.add_column(rich_escape(h))
             for r in rows:
@@ -459,80 +725,99 @@ class ConsoleUI:
             print(" | ".join(r))
 
     def markdown(self, text: str) -> None:
-        if self.rich_console is not None:
+        if self.rich_console is not None and Markdown is not None:
             self.rich_console.print()
-            self.rich_console.print(
-                Panel(
-                    Markdown(text),
-                    title="[bold cyan]GemPhone[/bold cyan]",
-                    border_style="cyan",
-                )
-            )
+            self.rich_console.print(Markdown(text))
             return
-        print(f"\nGemPhone >\n{text}")
+        print(f"\n{text}")
 
-    def tool_badge(self, name: str, args: dict[str, Any]) -> None:
-        items: list[str] = []
-        for k, v in args.items():
-            s = str(v).replace("\n", "\\n")
-            if len(s) > 42:
-                s = f"{s[:39]}..."
-            items.append(f"{k}={s}")
-        joined = ", ".join(items)
+    def tool_tree_result(
+        self,
+        name: str,
+        args: dict[str, Any],
+        status: str,
+        summary: str,
+    ) -> None:
+        """Древовидный лог инструмента в стиле Claude Code: ● Tool(args) / ⎿ summary."""
+        display = TOOL_DISPLAY_NAMES.get(name, name)
+        arg_str = _format_tool_args(args)
+        dot_color = "green" if status == "ok" else ("red" if status == "err" else "yellow")
+        sum_style = "dim" if status == "ok" else ("red" if status == "err" else "yellow")
+
         if self.rich_console is not None:
             self.rich_console.print(
-                f"[bold cyan]●[/bold cyan] [bold]{rich_escape(name)}[/bold][dim]({rich_escape(joined)})[/dim]"
+                f"[{dot_color}]●[/] [bold]{rich_escape(display)}[/bold][dim]({rich_escape(arg_str)})[/dim]"
             )
+            self.rich_console.print(f"  [bright_black]⎿[/]  [{sum_style}]{rich_escape(summary)}[/]")
         elif self.ansi:
-            print(f"\033[36m●\033[0m \033[1m{name}\033[0m\033[2m({joined})\033[0m")
+            code = "32" if status == "ok" else ("31" if status == "err" else "33")
+            print(f"\033[{code}m●\033[0m \033[1m{display}\033[0m\033[2m({arg_str})\033[0m")
+            print(f"  \033[90m⎿\033[0m  \033[2m{summary}\033[0m")
         else:
-            print(f"* {name}({joined})")
-
-    def tool_result(self, summary: str, *, ok: bool = True) -> None:
-        clean = summary.replace("\n", " ").strip()
-        if len(clean) > 110:
-            clean = clean[:107] + "..."
-        if self.rich_console is not None:
-            color = "dim" if ok else "red"
-            self.rich_console.print(f"  [dim]⎿[/dim]  [{color}]{rich_escape(clean)}[/{color}]")
-        elif self.ansi:
-            code = "2" if ok else "31"
-            print(f"  \033[2m⎿\033[0m  \033[{code}m{clean}\033[0m")
-        else:
-            print(f"  |_ {clean}")
+            print(f"* {display}({arg_str})\n  |_ {summary}")
 
     def diff(self, old_text: str, new_text: str, filename: str) -> None:
-        lines = list(
-            difflib.unified_diff(
-                old_text.splitlines(keepends=True),
-                new_text.splitlines(keepends=True),
-                fromfile=f"a/{filename}",
-                tofile=f"b/{filename}",
-                n=2,
-            )
-        )
-        if not lines:
-            self.dim("(без изменений)")
+        old_lines = old_text.splitlines()
+        new_lines = new_text.splitlines()
+        matcher = difflib.SequenceMatcher(None, old_lines, new_lines)
+        added = sum(j2 - j1 for tag, i1, i2, j1, j2 in matcher.get_opcodes() if tag in ("insert", "replace"))
+        removed = sum(i2 - i1 for tag, i1, i2, j1, j2 in matcher.get_opcodes() if tag in ("delete", "replace"))
+
+        if added == 0 and removed == 0:
+            self.dim("  (без изменений)")
             return
-        limit = 70
-        for line in lines[:limit]:
-            clean = line.rstrip("\r\n")
-            if self.rich_console is not None:
-                esc = rich_escape(clean)
-                if clean.startswith(("+++", "---")):
-                    self.rich_console.print(f"[bold]{esc}[/bold]")
-                elif clean.startswith("@@"):
-                    self.rich_console.print(f"[cyan]{esc}[/cyan]")
-                elif clean.startswith("+"):
-                    self.rich_console.print(f"[green]{esc}[/green]")
-                elif clean.startswith("-"):
-                    self.rich_console.print(f"[red]{esc}[/red]")
-                else:
-                    self.rich_console.print(f"[dim]{esc}[/dim]")
+
+        if self.rich_console is not None:
+            self.rich_console.print(
+                f"  [bold]{rich_escape(filename)}[/bold]  [green]+{added}[/green] [red]-{removed}[/red]"
+            )
+        else:
+            print(f"  {filename} (+{added} / -{removed})")
+
+        shown = 0
+        limit = 55
+        for group in matcher.get_grouped_opcodes(2):
+            for tag, i1, i2, j1, j2 in group:
+                if shown >= limit:
+                    break
+                if tag == "equal":
+                    for k in range(i1, i2):
+                        if shown >= limit:
+                            break
+                        self._print_diff_line(k + 1, " ", old_lines[k])
+                        shown += 1
+                elif tag in ("delete", "replace"):
+                    for k in range(i1, i2):
+                        if shown >= limit:
+                            break
+                        self._print_diff_line(k + 1, "-", old_lines[k])
+                        shown += 1
+                    if tag == "replace":
+                        for k in range(j1, j2):
+                            if shown >= limit:
+                                break
+                            self._print_diff_line(k + 1, "+", new_lines[k])
+                            shown += 1
+                elif tag == "insert":
+                    for k in range(j1, j2):
+                        if shown >= limit:
+                            break
+                        self._print_diff_line(k + 1, "+", new_lines[k])
+                        shown += 1
+        if shown >= limit:
+            self.dim("  … (остальные строки diff скрыты)")
+
+    def _print_diff_line(self, line_no: int, sign: str, content: str) -> None:
+        if self.rich_console is not None:
+            esc = rich_escape(content)
+            if sign == "+":
+                self.rich_console.print(f"  [dim]{line_no:4d}[/dim] [green on #142f1c]+ {esc}[/]")
+            elif sign == "-":
+                self.rich_console.print(f"  [dim]{line_no:4d}[/dim] [red on #331616]- {esc}[/]")
             else:
-                print(clean)
-        if len(lines) > limit:
-            self.warn(f"... ещё {len(lines) - limit} строк diff скрыто")
+                self.rich_console.print(f"  [dim]{line_no:4d}   {esc}[/dim]")
+        else:
+            print(f"  {line_no:4d} {sign} {content}")
 
     def done_banner(
         self,
@@ -542,35 +827,25 @@ class ConsoleUI:
         elapsed: float,
         status: str = "done",
     ) -> None:
-        stats = f"шагов: {steps} | токенов: {format_tokens(tokens)} | время: {elapsed:.1f}с"
+        stats = f"{steps} ш. · {format_tokens(tokens)} ток. · {elapsed:.1f}с"
         if status == "done":
-            label = f"✓ ГОТОВО  ({stats})"
-            style = "bold black on green"
-            ansi_code = "1;32"
+            icon, title, color = "✓", "Готово", "green"
         elif status == "limit":
-            label = f"⏸ ПАУЗА: ЛИМИТ ШАГОВ  ({stats})"
-            style = "bold black on yellow"
-            ansi_code = "1;33"
+            icon, title, color = "⏸", "Лимит шагов", "yellow"
         else:
-            label = f"⏹ ОСТАНОВЛЕНО  ({stats})"
-            style = "bold white on red"
-            ansi_code = "1;31"
+            icon, title, color = "⏹", "Остановлено", "red"
 
         if self.rich_console is not None:
-            self.rich_console.print(f"[{style}] {rich_escape(label)} [/]")
+            self.rich_console.print(f"\n[{color}]{icon} {title}[/] [dim]· {rich_escape(stats)}[/dim]")
         elif self.ansi:
-            print(f"\033[{ansi_code}m=== {label} ===\033[0m")
+            code = "32" if status == "done" else ("33" if status == "limit" else "31")
+            print(f"\n\033[{code}m{icon} {title}\033[0m \033[2m· {stats}\033[0m")
         else:
-            print(f"=== {label} ===")
+            print(f"\n{icon} {title} · {stats}")
 
 
 class CancellationMonitor:
-    """
-    Отслеживает отмену текущего запроса из трёх источников одновременно:
-    1. Клавиши ESC / Enter / Ctrl+C в терминале Termux.
-    2. Кнопка «⏹ Отменить» в уведомлении шторки Android (через файл-флаг).
-    3. Сигнал SIGINT.
-    """
+    """Отслеживает отмену запроса по ESC / Ctrl+C в Termux или кнопке в шторке Android."""
 
     def __init__(self, cancel_flag: Path = CANCEL_FLAG_PATH) -> None:
         self.cancel_flag = cancel_flag
@@ -591,7 +866,7 @@ class CancellationMonitor:
         return self.event.is_set()
 
     def _enable_cbreak(self) -> None:
-        if HAS_TERMIOS and termios is not None and tty is not None and bool(getattr(sys.stdin, "isatty", lambda: False)()):
+        if HAS_TERMIOS and termios is not None and tty is not None and sys.stdin.isatty():
             try:
                 self._stdin_fd = sys.stdin.fileno()
                 if self._old_termios is None:
@@ -635,7 +910,6 @@ class CancellationMonitor:
             self.cancel_flag.unlink(missing_ok=True)
         except OSError:
             pass
-
         self._enable_cbreak()
         self._thread = threading.Thread(target=self._watch_loop, daemon=True)
         self._thread.start()
@@ -658,19 +932,23 @@ class CancellationMonitor:
             if self._paused.is_set():
                 self._stop_watcher.wait(0.05)
                 continue
-
             if self.cancel_flag.exists():
                 self.cancel("Отменено кнопкой из шторки уведомлений")
                 return
-
             if self._stdin_fd is not None:
                 try:
                     readable, _, _ = select.select([self._stdin_fd], [], [], 0.08)
                     if readable and not self._paused.is_set():
                         ch = os.read(self._stdin_fd, 1)
-                        if ch in (b"\x1b", b"\x03", b"\r", b"\n"):
-                            label = "ESC" if ch == b"\x1b" else ("Ctrl+C" if ch == b"\x03" else "Enter")
-                            self.cancel(f"Отменено клавишей {label}")
+                        if ch == b"\x1b":
+                            more, _, _ = select.select([self._stdin_fd], [], [], 0.03)
+                            if more:
+                                os.read(self._stdin_fd, 8)
+                            else:
+                                self.cancel("Отменено клавишей ESC")
+                                return
+                        elif ch == b"\x03":
+                            self.cancel("Отменено клавишей Ctrl+C")
                             return
                 except Exception:
                     pass
@@ -725,7 +1003,7 @@ class PhoneNotifier:
         threading.Thread(target=_worker, daemon=True).start()
 
     def _terminal_bell(self) -> None:
-        if bool(getattr(sys.stdout, "isatty", lambda: False)()):
+        if sys.stdout.isatty():
             try:
                 sys.stdout.write("\a")
                 sys.stdout.flush()
@@ -745,9 +1023,9 @@ class PhoneNotifier:
                 "--id",
                 self.NOTIF_ID,
                 "--title",
-                "⏳ GemPhone работает... (ESC в Termux — стоп)",
+                "⏳ GemPhone работает…",
                 "--content",
-                snippet or "Выполняю задачу...",
+                snippet or "Выполняю задачу…",
                 "--ongoing",
                 "--button1",
                 "⏹ Отменить",
@@ -768,7 +1046,7 @@ class PhoneNotifier:
         meta = f"{steps} ш. · {format_tokens(tokens)} ток. · {elapsed:.1f}с"
 
         if self.vibrate:
-            self._run_cmd_async(["termux-vibrate", "-d", "180"])
+            self._run_cmd_async(["termux-vibrate", "-d", "160"])
         if self.toast:
             self._run_cmd_async(["termux-toast", "-g", "top", f"✅ GemPhone закончил ({meta})"])
         if self.notification:
@@ -799,7 +1077,7 @@ class PhoneNotifier:
         clean = re.sub(r"\s+", " ", reason).strip()[:120]
 
         if self.vibrate:
-            self._run_cmd_async(["termux-vibrate", "-d", "320"])
+            self._run_cmd_async(["termux-vibrate", "-d", "300"])
         if self.toast:
             self._run_cmd_async(["termux-toast", "-g", "top", f"⚠️ GemPhone ждёт ответ: {clean[:60]}"])
         if self.notification:
@@ -828,7 +1106,7 @@ class PhoneNotifier:
         clean = re.sub(r"\s+", " ", message).strip()[:140]
 
         if self.vibrate:
-            self._run_cmd_async(["termux-vibrate", "-d", "420"])
+            self._run_cmd_async(["termux-vibrate", "-d", "380"])
         if self.toast:
             self._run_cmd_async(["termux-toast", "-g", "top", "❌ GemPhone: ошибка (см. Termux)"])
         if self.notification:
@@ -976,6 +1254,7 @@ class ProviderConfig:
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any]) -> ProviderConfig:
         preset = PROVIDER_PRESETS.get(name, {})
+        default_vision = bool(preset.get("supports_vision", name not in ("gemini-sub", "claude-sub", "chatgpt-sub")))
         return cls(
             name=name,
             provider_type=str(data.get("type", preset.get("type", "openai"))).lower(),
@@ -985,7 +1264,7 @@ class ProviderConfig:
             env_var=str(data.get("env_var", preset.get("env_var", ""))).strip(),
             cli_command=str(data.get("cli_command", preset.get("cli_command", ""))).strip(),
             requires_key=bool(data.get("requires_key", preset.get("requires_key", True))),
-            supports_vision=bool(data.get("supports_vision", preset.get("supports_vision", True))),
+            supports_vision=bool(data.get("supports_vision", default_vision)),
             description=str(data.get("description", preset.get("description", ""))),
         )
 
@@ -1340,8 +1619,6 @@ def _http_get_text(url: str, timeout: int = 20) -> tuple[int, str, str]:
 
 
 class BaseLLMClient(ABC):
-    """Абстрактный мультимодальный клиент с поддержкой сжатия старого контекста."""
-
     def __init__(self, config: ProviderConfig, api_key: str, timeout: int = DEFAULT_HTTP_TIMEOUT) -> None:
         self.config = config
         self.api_key = api_key
@@ -1395,11 +1672,7 @@ class BaseLLMClient(ABC):
 
 
 class GeminiRestClient(BaseLLMClient):
-    """
-    Нативный клиент Google AI Studio / Vertex OAuth.
-    Поддерживает как обычный API-ключ AI Studio (AIza...), так и Google OAuth Bearer-токен
-    (если ключ начинается на 'ya29.' или задано слово 'gcloud' для автополучения токена).
-    """
+    """Нативный клиент Google AI Studio / Vertex OAuth."""
 
     def __init__(self, config: ProviderConfig, api_key: str, timeout: int = DEFAULT_HTTP_TIMEOUT) -> None:
         super().__init__(config, api_key, timeout)
@@ -1475,9 +1748,7 @@ class GeminiRestClient(BaseLLMClient):
                     elif idx < keep_recent_from:
                         serialized = json.dumps(fr.get("response", {}), ensure_ascii=False)
                         if len(serialized) > STALE_TOOL_OUTPUT_CHARS:
-                            fr["response"] = {
-                                "pruned_preview": serialized[:STALE_TOOL_OUTPUT_CHARS] + "..."
-                            }
+                            fr["response"] = {"pruned_preview": serialized[:STALE_TOOL_OUTPUT_CHARS] + "..."}
                 new_parts.append(part)
             msg["parts"] = new_parts
 
@@ -1493,7 +1764,7 @@ class GeminiRestClient(BaseLLMClient):
                 proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
                 if proc.returncode == 0 and proc.stdout.strip():
                     return {"Authorization": f"Bearer {proc.stdout.strip()}"}
-            raise ApiError("Не удалось получить OAuth-токен от gcloud. Выполните `gcloud auth application-default login`.")
+            raise ApiError("Не удалось получить OAuth-токен от gcloud.")
         if token.startswith("ya29."):
             return {"Authorization": f"Bearer {token}"}
         return {"x-goog-api-key": token}
@@ -1626,10 +1897,7 @@ class OpenAICompatClient(BaseLLMClient):
             role = msg.get("role")
 
             if role == "user" and isinstance(msg.get("content"), list):
-                has_img = any(
-                    isinstance(blk, dict) and blk.get("type") == "image_url"
-                    for blk in msg["content"]
-                )
+                has_img = any(isinstance(blk, dict) and blk.get("type") == "image_url" for blk in msg["content"])
                 if has_img:
                     if seen_image:
                         msg["content"] = "[old screenshot pruned to save tokens]"
@@ -1701,19 +1969,19 @@ class OpenAICompatClient(BaseLLMClient):
         )
         choices = response.get("choices")
         if not choices or not isinstance(choices[0], dict):
-            raise ApiError("Некорректный ответ API: отсутствует choices.")
+            raise ApiError("Некорректный ответ OpenAI-совместимого API: отсутствует choices.")
 
         msg = choices[0].get("message")
         if not isinstance(msg, dict):
-            raise ApiError("Некорректный ответ API: отсутствует message.")
+            raise ApiError("Некорректный ответ OpenAI-совместимого API: отсутствует message.")
 
         raw_content = msg.get("content")
-        raw_calls = msg.get("tool_calls") or []
+        raw_tool_calls = msg.get("tool_calls") or []
         record: dict[str, Any] = {
             "role": "assistant",
             "content": raw_content if raw_content is not None else "",
         }
-        if raw_calls:
+        if raw_calls := raw_tool_calls:
             if msg.get("reasoning_content") is not None:
                 record["reasoning_content"] = msg["reasoning_content"]
             if msg.get("reasoning_details") is not None:
@@ -1721,35 +1989,21 @@ class OpenAICompatClient(BaseLLMClient):
             record["tool_calls"] = raw_calls
         self._messages.append(record)
 
-        calls: list[ToolCall] = []
-        for idx, tc in enumerate(raw_calls):
+        parsed_calls: list[ToolCall] = []
+        for idx, tc in enumerate(raw_tool_calls):
             if not isinstance(tc, dict):
                 continue
             fn = tc.get("function") or {}
-            raw_args = fn.get("arguments")
-            parsed_args: dict[str, Any] = {}
-            if isinstance(raw_args, dict):
-                parsed_args = raw_args
-            elif isinstance(raw_args, str) and raw_args.strip():
-                try:
-                    loaded = json.loads(raw_args)
-                    if isinstance(loaded, dict):
-                        parsed_args = loaded
-                except json.JSONDecodeError:
-                    pass
-            calls.append(
-                ToolCall(
-                    id=str(tc.get("id") or f"call_{idx}_{int(time.time())}"),
-                    name=str(fn.get("name") or ""),
-                    args=parsed_args,
-                )
-            )
+            call_id = str(tc.get("id") or f"call_{idx}_{int(time.time())}")
+            fn_name = str(fn.get("name") or "")
+            fn_args = self._parse_arguments(fn.get("arguments"))
+            parsed_calls.append(ToolCall(id=call_id, name=fn_name, args=fn_args))
 
         text = self._extract_text(raw_content)
         usage = response.get("usage") or {}
         return TurnResponse(
             text=text,
-            tool_calls=calls,
+            tool_calls=parsed_calls,
             prompt_tokens=int(usage.get("prompt_tokens", 0)),
             completion_tokens=int(usage.get("completion_tokens", 0)),
             total_tokens=int(usage.get("total_tokens", 0)),
@@ -1768,9 +2022,24 @@ class OpenAICompatClient(BaseLLMClient):
             return "\n".join(p for p in parts if p).strip()
         return ""
 
+    @staticmethod
+    def _parse_arguments(raw_args: Any) -> dict[str, Any]:
+        if isinstance(raw_args, dict):
+            return raw_args
+        if isinstance(raw_args, str):
+            cleaned = raw_args.strip()
+            if not cleaned:
+                return {}
+            try:
+                parsed = json.loads(cleaned)
+                return parsed if isinstance(parsed, dict) else {}
+            except json.JSONDecodeError:
+                return {}
+        return {}
+
 
 class AnthropicRestClient(BaseLLMClient):
-    """Нативный клиент Anthropic Claude API (/v1/messages) с поддержкой Vision и Token-Saver."""
+    """Нативный клиент Anthropic Claude API (/v1/messages)."""
 
     def __init__(self, config: ProviderConfig, api_key: str, timeout: int = DEFAULT_HTTP_TIMEOUT) -> None:
         super().__init__(config, api_key, timeout)
@@ -1825,8 +2094,7 @@ class AnthropicRestClient(BaseLLMClient):
                     continue
                 content = blk.get("content")
                 if isinstance(content, list):
-                    has_img = any(isinstance(c, dict) and c.get("type") == "image" for c in content)
-                    if has_img:
+                    if any(isinstance(c, dict) and c.get("type") == "image" for c in content):
                         if seen_image:
                             blk["content"] = "[old screenshot pruned]"
                         else:
@@ -1903,13 +2171,7 @@ class AnthropicRestClient(BaseLLMClient):
 
 
 class CliSubscriptionClient(BaseLLMClient):
-    """
-    Официальный OAuth-мост для работы по подпискам без оплаты за токены API:
-    - Claude Pro / Max   -> `claude -p --output-format json` (Claude Code CLI)
-    - Gemini / Google Pro -> `gemini -o json` (Gemini CLI)
-    - ChatGPT Plus / Pro -> `codex exec -` (OpenAI Codex CLI)
-    Сохраняет полную работу всех 22 инструментов GemPhone через структурированный JSON-протокол.
-    """
+    """OAuth-мост для работы по подпискам (Claude Pro/Max, Gemini Pro, ChatGPT Plus/Pro)."""
 
     _JSON_BLOCK_RE: Final[re.Pattern[str]] = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
@@ -1939,13 +2201,11 @@ class CliSubscriptionClient(BaseLLMClient):
         for call, res in results:
             body = json.dumps(res.payload, ensure_ascii=False)
             lines.append(f"Tool `{call.name}` result: {body}")
-            if res.image is not None and self.config.supports_vision:
-                try:
-                    APP_DIR.mkdir(parents=True, exist_ok=True)
-                    LAST_SCREENSHOT_PATH.write_bytes(base64.b64decode(res.image.data_b64))
-                    lines.append(f"[Screenshot saved at: {LAST_SCREENSHOT_PATH}]")
-                except Exception:
-                    pass
+            if res.image is not None:
+                lines.append(
+                    "[Note: Screenshot image cannot be attached directly in CLI subscription mode; "
+                    "use `adb_ui_dump` for UI elements and text.]"
+                )
         self._history.append({"role": "tool", "content": "\n".join(lines)})
 
     def prune_stale_context(self) -> None:
@@ -1958,7 +2218,6 @@ class CliSubscriptionClient(BaseLLMClient):
 
     def _build_prompt(self, tool_specs: list[dict[str, Any]], system_instruction: str) -> str:
         sections: list[str] = [f"[SYSTEM]\n{system_instruction}"]
-
         if tool_specs:
             compact_tools: list[str] = []
             for spec in tool_specs:
@@ -1970,15 +2229,14 @@ class CliSubscriptionClient(BaseLLMClient):
                 "[GEMPHONE TOOLS — USE THESE INSTEAD OF ANY BUILT-IN CLI TOOLS]\n"
                 + "\n".join(compact_tools)
                 + "\n\n[TOOL CALLING FORMAT]\n"
-                "To invoke one or more GemPhone tools, reply ONLY with a single JSON object:\n"
+                "To invoke one or more GemPhone tools, include a JSON object:\n"
                 '{"thought": "brief plan", "tool_calls": [{"name": "tool_name", "args": {...}}]}\n'
                 "If no tool call is needed and you are ready to answer the user, reply in normal plain text."
             )
-
-        conv_lines: list[str] = []
-        for item in self._history:
-            tag = "USER" if item["role"] == "user" else ("ASSISTANT" if item["role"] == "assistant" else "TOOL_RESULTS")
-            conv_lines.append(f"{tag}:\n{item['content']}")
+        conv_lines = [
+            f"{'USER' if i['role'] == 'user' else ('ASSISTANT' if i['role'] == 'assistant' else 'TOOL_RESULTS')}:\n{i['content']}"
+            for i in self._history
+        ]
         sections.append("[CONVERSATION]\n" + "\n\n".join(conv_lines))
         return "\n\n".join(sections)
 
@@ -1992,7 +2250,6 @@ class CliSubscriptionClient(BaseLLMClient):
             hint = SUBSCRIPTION_INSTALL_HINTS.get(self.config.name)
             install_msg = f" Установите: `{hint[0]}` и войдите через `/login {self.config.name}`." if hint else ""
             raise ApiError(f"CLI `{binary}` не найден в Termux.{install_msg}")
-
         if self.model and self.model.lower() not in ("default", "auto", ""):
             if "--model" not in cmd and "-m" not in cmd:
                 cmd.extend(["--model", self.model])
@@ -2009,7 +2266,6 @@ class CliSubscriptionClient(BaseLLMClient):
             encoding="utf-8",
             errors="replace",
         )
-
         out_box: list[tuple[str, str]] = []
         err_box: list[BaseException] = []
 
@@ -2058,18 +2314,13 @@ class CliSubscriptionClient(BaseLLMClient):
             data = json.loads(cleaned)
         except json.JSONDecodeError:
             return cleaned, 0, 0, 0
-
         if not isinstance(data, dict):
             return cleaned, 0, 0, 0
-
-        # Формат Claude Code (`claude -p --output-format json`)
         if "result" in data and isinstance(data["result"], str):
             usage = data.get("usage") or {}
             in_tok = int(usage.get("input_tokens", 0))
             out_tok = int(usage.get("output_tokens", 0))
             return data["result"].strip(), in_tok, out_tok, in_tok + out_tok
-
-        # Формат Gemini CLI (`gemini -o json`)
         if "response" in data and isinstance(data["response"], str):
             stats = data.get("stats") or {}
             models_stats = stats.get("models") if isinstance(stats, dict) else None
@@ -2081,18 +2332,34 @@ class CliSubscriptionClient(BaseLLMClient):
                         in_tok += int(toks.get("prompt", 0))
                         out_tok += int(toks.get("candidates", 0))
             return data["response"].strip(), in_tok, out_tok, in_tok + out_tok
-
         return cleaned, 0, 0, 0
 
     def _extract_tool_calls(self, text: str) -> tuple[str, list[ToolCall]]:
-        candidates: list[str] = []
-        stripped = text.strip()
-        if stripped.startswith("{") and stripped.endswith("}"):
-            candidates.append(stripped)
+        candidates: list[tuple[str, str]] = []
         for m in self._JSON_BLOCK_RE.finditer(text):
-            candidates.append(m.group(1).strip())
+            prefix = text[: m.start()].strip()
+            suffix = text[m.end() :].strip()
+            candidates.append((m.group(1).strip(), f"{prefix}\n{suffix}".strip()))
 
-        for raw_json in candidates:
+        decoder = json.JSONDecoder()
+        idx = 0
+        while True:
+            brace_idx = text.find("{", idx)
+            if brace_idx == -1:
+                break
+            try:
+                obj, end_idx = decoder.raw_decode(text, brace_idx)
+                if isinstance(obj, dict) and isinstance(obj.get("tool_calls"), list):
+                    prefix = text[:brace_idx].strip()
+                    suffix = text[end_idx:].strip()
+                    candidates.append((text[brace_idx:end_idx], f"{prefix}\n{suffix}".strip()))
+                    idx = end_idx
+                    continue
+            except json.JSONDecodeError:
+                pass
+            idx = brace_idx + 1
+
+        for raw_json, leftover_text in candidates:
             try:
                 obj = json.loads(raw_json)
             except json.JSONDecodeError:
@@ -2100,22 +2367,21 @@ class CliSubscriptionClient(BaseLLMClient):
             if not isinstance(obj, dict) or not isinstance(obj.get("tool_calls"), list):
                 continue
             calls: list[ToolCall] = []
-            for idx, item in enumerate(obj["tool_calls"]):
+            for c_idx, item in enumerate(obj["tool_calls"]):
                 if not isinstance(item, dict) or not item.get("name"):
                     continue
                 args = item.get("args")
                 calls.append(
                     ToolCall(
-                        id=f"cli_{idx}_{int(time.time())}",
+                        id=f"cli_{c_idx}_{int(time.time())}",
                         name=str(item["name"]),
                         args=args if isinstance(args, dict) else {},
                     )
                 )
             if calls:
-                thought = str(obj.get("thought") or "").strip()
+                thought = str(obj.get("thought") or leftover_text or "").strip()
                 return thought, calls
-
-        return stripped, []
+        return text.strip(), []
 
     def generate_step(
         self,
@@ -2155,7 +2421,7 @@ def create_llm_client(config: ProviderConfig, api_key: str) -> BaseLLMClient:
 
 
 # ---------------------------------------------------------------------------
-# Ядро управления Android: ADB + UI Automator + Termux:API
+# Ядро управления Android: AccessibilityService Bridge + ADB + Termux:API
 # ---------------------------------------------------------------------------
 
 
@@ -2173,6 +2439,7 @@ class UiElement:
     scrollable: bool
     editable: bool
     focused: bool
+    node_id: str = ""
 
     def to_compact_line(self) -> str:
         flags: list[str] = []
@@ -2195,146 +2462,219 @@ class UiElement:
         return f"{self.element_id}:{flag_str}{lbl_str}{res_str} @{self.center_x},{self.center_y}"
 
 
-
 class AccessibilityBridgeClient:
-    """HTTP-клиент локального Android-компаньона GemPhone Bridge (AccessibilityService, 127.0.0.1:7331)."""
-
-    def __init__(self, base_url: str | None = None, token: str | None = None) -> None:
-        self.base_url = (base_url or os.environ.get("GEMPHONE_BRIDGE_URL") or DEFAULT_BRIDGE_URL).rstrip("/")
-        self._explicit_token = token
-
-    def effective_token(self) -> str:
-        if self._explicit_token is not None:
-            return self._explicit_token.strip()
-        env_tok = os.environ.get("GEMPHONE_BRIDGE_TOKEN", "").strip()
-        if env_tok:
-            return env_tok
-        if BRIDGE_TOKEN_PATH.exists():
-            try:
-                return BRIDGE_TOKEN_PATH.read_text(encoding="utf-8").strip()
-            except OSError:
-                return ""
-        return ""
-
-    def save_token(self, token: str) -> None:
-        APP_DIR.mkdir(parents=True, exist_ok=True)
-        tok = token.strip()
-        self._explicit_token = tok
-        fd = os.open(BRIDGE_TOKEN_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(tok + "\n")
-        os.chmod(BRIDGE_TOKEN_PATH, 0o600)
-
-    def _headers(self, *, json_body: bool = False) -> dict[str, str]:
-        h: dict[str, str] = {"User-Agent": HTTP_USER_AGENT}
-        if json_body:
-            h["Content-Type"] = "application/json; charset=utf-8"
-        tok = self.effective_token()
-        if tok:
-            h["X-GemPhone-Token"] = tok
-        return h
-
-    def request_json(
-        self,
-        method: str,
-        path: str,
-        payload: dict[str, Any] | None = None,
-        *,
-        timeout: float = 8.0,
-    ) -> dict[str, Any]:
-        url = f"{self.base_url}{path}"
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
-        req = urllib.request.Request(url, data=data, headers=self._headers(json_body=data is not None), method=method)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-                return json.loads(raw) if raw.strip() else {}
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Bridge HTTP {exc.code}: {body[:200]}") from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise RuntimeError(f"Bridge недоступен ({self.base_url}): {exc}") from exc
-
-    def request_bytes(self, path: str, *, timeout: float = 12.0) -> bytes:
-        url = f"{self.base_url}{path}"
-        req = urllib.request.Request(url, headers=self._headers(), method="GET")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read()
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Bridge HTTP {exc.code}: {body[:200]}") from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise RuntimeError(f"Bridge недоступен ({self.base_url}): {exc}") from exc
-
-    def is_available(self, *, timeout: float = 0.6) -> bool:
-        try:
-            st = self.request_json("GET", "/status", timeout=timeout)
-            return bool(st.get("ok") and st.get("accessibility_enabled", True))
-        except Exception:
-            return False
-
-    def status(self, *, timeout: float = 1.5) -> dict[str, Any]:
-        return self.request_json("GET", "/status", timeout=timeout)
-
-
-class PhoneController:
-    """Высокоуровневый драйвер Android для Termux (ADB + Termux:API)."""
-
-    _BOUNDS_RE: Final[re.Pattern[str]] = re.compile(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]")
+    """Клиент локального HTTP-моста GemPhone Bridge (AccessibilityService на 127.0.0.1:7331)."""
 
     def __init__(
         self,
-        target_serial: str | None = None,
-        bridge_url: str | None = None,
-        bridge_mode: Literal["auto", "bridge", "adb"] = "auto",
+        host: str = BRIDGE_DEFAULT_HOST,
+        port: int = BRIDGE_DEFAULT_PORT,
+        token_path: Path = BRIDGE_TOKEN_PATH,
+        timeout: float = 8.0,
     ) -> None:
+        self.host = host
+        self.port = port
+        self.token_path = token_path
+        self.timeout = timeout
+        self.token: str = self.load_token()
+        self._last_ping_at: float = 0.0
+        self._last_ping_ok: bool = False
+        self._last_unauthorized: bool = False
+        self._last_info: dict[str, Any] = {}
+
+    def load_token(self) -> str:
+        # Файл — источник истины (его пишет и /bridge token, и сам сервис).
+        # env GEMPHONE_BRIDGE_TOKEN — только фолбэк, если файла нет.
+        if self.token_path.exists():
+            try:
+                file_tok = self.token_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                file_tok = ""
+            if file_tok:
+                return file_tok
+        env_tok = os.environ.get("GEMPHONE_BRIDGE_TOKEN", "").strip()
+        if env_tok:
+            return env_tok
+        return ""
+
+    def save_token(self, token: str) -> None:
+        cleaned = token.strip()
+        self.token = cleaned
+        self._last_ping_at = 0.0
+        self._last_unauthorized = False
+        try:
+            self.token_path.parent.mkdir(parents=True, exist_ok=True)
+            self.token_path.write_text(cleaned + "\n", encoding="utf-8")
+            try:
+                os.chmod(self.token_path, 0o600)
+            except OSError:
+                pass
+        except OSError:
+            pass
+
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> tuple[int, dict[str, Any], bytes]:
+        if not self.token:
+            self.token = self.load_token()
+        url = f"{self.base_url()}{path}"
+        if params:
+            url = f"{url}?{urllib.parse.urlencode(params)}"
+        headers: dict[str, str] = {"User-Agent": HTTP_USER_AGENT}
+        if self.token:
+            headers["x-gemphone-token"] = self.token
+        data: bytes | None = None
+        if json_body is not None:
+            headers["Content-Type"] = "application/json; charset=utf-8"
+            data = json.dumps(json_body, ensure_ascii=False).encode("utf-8")
+
+        req = urllib.request.Request(url=url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
+                raw = resp.read()
+                ctype = resp.headers.get("Content-Type", "")
+                parsed: dict[str, Any] = {}
+                if "json" in ctype.lower():
+                    try:
+                        obj = json.loads(raw.decode("utf-8"))
+                        if isinstance(obj, dict):
+                            parsed = obj
+                    except json.JSONDecodeError:
+                        pass
+                return resp.status, parsed, raw
+        except urllib.error.HTTPError as exc:
+            raw = exc.read()
+            parsed = {}
+            try:
+                obj = json.loads(raw.decode("utf-8", errors="replace"))
+                if isinstance(obj, dict):
+                    parsed = obj
+            except json.JSONDecodeError:
+                pass
+            return exc.code, parsed, raw
+
+    def is_available(self, *, force: bool = False) -> bool:
+        now = time.monotonic()
+        if not force and (now - self._last_ping_at) < 4.0:
+            return self._last_ping_ok
+        self._last_ping_at = now
+        try:
+            status, info, _ = self._request("GET", "/status", timeout=2.5)
+            if status in (401, 403):
+                self._last_ping_ok = False
+                self._last_unauthorized = True
+                return False
+            self._last_unauthorized = False
+            ok = status == 200 and bool(info.get("service_running", True))
+            self._last_ping_ok = ok
+            if ok and info:
+                self._last_info = info
+            return ok
+        except Exception:
+            self._last_ping_ok = False
+            self._last_unauthorized = False
+            return False
+
+    def status_info(self) -> dict[str, Any]:
+        if self.is_available(force=True) and self._last_info:
+            return dict(self._last_info)
+        return {
+            "connected": False,
+            "unauthorized": self._last_unauthorized,
+            "port": self.port,
+            "token_set": bool(self.token),
+        }
+
+    def dump_ui(self, *, only_interactive: bool = False) -> dict[str, Any]:
+        _, data, _ = self._request(
+            "GET", "/ui?only_interactive=" + ("1" if only_interactive else "0"), timeout=15.0
+        )
+        if not data.get("ok", True) and data.get("error"):
+            raise RuntimeError(str(data["error"]))
+        return data
+
+    def tap(self, *, x: int, y: int, node_id: str = "", long_press: bool = False, duration_ms: int = 700) -> dict[str, Any]:
+        _, data, _ = self._request(
+            "POST",
+            "/tap",
+            json_body={"x": x, "y": y, "duration_ms": duration_ms if long_press else 60},
+            timeout=10.0,
+        )
+        if data.get("error"):
+            raise RuntimeError(str(data["error"]))
+        return data
+
+    def swipe(self, *, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 320) -> dict[str, Any]:
+        _, data, _ = self._request(
+            "POST",
+            "/swipe",
+            json_body={"x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration_ms": duration_ms},
+            timeout=10.0,
+        )
+        if data.get("error"):
+            raise RuntimeError(str(data["error"]))
+        return data
+
+    def type_text(self, text: str, *, press_enter: bool = False) -> dict[str, Any]:
+        _, data, _ = self._request(
+            "POST",
+            "/type",
+            json_body={"text": text, "press_enter": press_enter},
+            timeout=10.0,
+        )
+        if data.get("error"):
+            raise RuntimeError(str(data["error"]))
+        return data
+
+    def global_action(self, action_name: str) -> dict[str, Any]:
+        _, data, _ = self._request("POST", "/key", json_body={"key": action_name}, timeout=10.0)
+        if data.get("error"):
+            raise RuntimeError(str(data["error"]))
+        return data
+
+    def capture_screenshot_bytes(self) -> tuple[bytes, str]:
+        _, data, raw = self._request("GET", "/screenshot", timeout=20.0)
+        if data and isinstance(data.get("image_b64"), str) and data["image_b64"]:
+            mime = str(data.get("mime_type") or "image/jpeg")
+            return base64.b64decode(data["image_b64"]), mime
+        if data and data.get("error"):
+            raise RuntimeError(str(data["error"]))
+        if len(raw) > 100:
+            mime = "image/png" if raw.startswith(b"\x89PNG") else "image/jpeg"
+            return raw, mime
+        raise RuntimeError("Bridge не вернул изображение скриншота (проверьте Android 11+ / takeScreenshot).")
+
+
+class PhoneController:
+    """
+    Высокоуровневый драйвер Android для Termux:
+    основной быстрый транспорт — AccessibilityService Bridge (без ADB и Wi-Fi),
+    резервный транспорт — Wireless ADB + Termux:API.
+    """
+
+    _BOUNDS_RE: Final[re.Pattern[str]] = re.compile(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]")
+
+    def __init__(self, target_serial: str | None = None, bridge: AccessibilityBridgeClient | None = None) -> None:
         self.target_serial = target_serial
-        self.bridge = AccessibilityBridgeClient(base_url=bridge_url)
-        self.bridge_mode: Literal["auto", "bridge", "adb"] = bridge_mode
+        self.bridge = bridge or AccessibilityBridgeClient()
         self.last_ui_elements: dict[int, UiElement] = {}
         self._screen_size_cache: tuple[int, int] | None = None
+        self._adb_cache_at: float = 0.0
+        self._adb_devices_cache: list[dict[str, str]] = []
         self.screenshot_max_dim: int = SCREENSHOT_MAX_DIM
         self.screenshot_quality: int = SCREENSHOT_JPEG_QUALITY
-        self._transport_cache: tuple[float, str, str] | None = None
-        self._transport_ttl: float = 5.0
 
-    def invalidate_transport_cache(self) -> None:
-        self._transport_cache = None
-
-    def _probe_transport(self) -> tuple[str, str]:
-        if self.bridge_mode in ("auto", "bridge") and self.bridge.is_available():
-            return ("bridge", f"Bridge:{self.bridge.base_url.rsplit(':', 1)[-1]}")
-        if self.bridge_mode == "bridge":
-            return ("none", "Bridge: нет (/bridge)")
-        serial = self.active_adb_serial()
-        if serial:
-            return ("adb", f"ADB:{serial}")
-        return ("none", "Нет связи (/bridge или /adb)")
-
-    def active_transport(self, *, force_refresh: bool = False) -> tuple[str, str]:
-        now = time.monotonic()
-        if not force_refresh and self._transport_cache is not None:
-            ts, kind, label = self._transport_cache
-            if now - ts < self._transport_ttl:
-                return (kind, label)
-        kind, label = self._probe_transport()
-        self._transport_cache = (now, kind, label)
-        return (kind, label)
-
-    def cached_transport_label(self) -> str:
-        """Мгновенный статус для нижней панели ввода — НИКОГДА не вызывает subprocess/сеть."""
-        if self._transport_cache is not None:
-            return self._transport_cache[2]
-        return "Bridge/ADB: ?"
-
-    def _use_bridge(self) -> bool:
-        if self.bridge_mode == "adb":
-            return False
-        if self.bridge_mode == "bridge":
-            return True
-        kind, _ = self.active_transport()
-        return kind == "bridge"
+    def has_bridge(self, *, force: bool = False) -> bool:
+        return self.bridge.is_available(force=force)
 
     def has_adb(self) -> bool:
         return shutil.which("adb") is not None
@@ -2342,19 +2682,30 @@ class PhoneController:
     def has_termux_api(self) -> bool:
         return shutil.which("termux-battery-status") is not None
 
-    def adb_devices(self) -> list[dict[str, str]]:
+    def invalidate_adb_cache(self) -> None:
+        self._adb_cache_at = 0.0
+
+    def adb_devices(self, *, force: bool = False) -> list[dict[str, str]]:
         if not self.has_adb():
             return []
-        proc = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=8)
-        devices: list[dict[str, str]] = []
-        for line in proc.stdout.splitlines()[1:]:
-            parts = line.strip().split()
-            if len(parts) >= 2:
-                devices.append({"serial": parts[0], "state": parts[1]})
-        return devices
+        now = time.monotonic()
+        if not force and (now - self._adb_cache_at) < ADB_CACHE_TTL_SEC:
+            return list(self._adb_devices_cache)
+        try:
+            proc = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=6)
+            devices: list[dict[str, str]] = []
+            for line in proc.stdout.splitlines()[1:]:
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    devices.append({"serial": parts[0], "state": parts[1]})
+            self._adb_devices_cache = devices
+            self._adb_cache_at = now
+            return list(devices)
+        except Exception:
+            return list(self._adb_devices_cache)
 
-    def active_adb_serial(self) -> str | None:
-        devices = [d for d in self.adb_devices() if d["state"] == "device"]
+    def active_adb_serial(self, *, force: bool = False) -> str | None:
+        devices = [d for d in self.adb_devices(force=force) if d["state"] == "device"]
         if not devices:
             return None
         if self.target_serial:
@@ -2363,6 +2714,17 @@ class PhoneController:
                     return self.target_serial
         return devices[0]["serial"]
 
+    def transport_badge(self, *, force: bool = False) -> str:
+        bridge_ok = self.has_bridge(force=force)
+        adb_ser = self.active_adb_serial(force=force)
+        if bridge_ok and adb_ser:
+            return f"Bridge:{self.bridge.port} + ADB"
+        if bridge_ok:
+            return f"Bridge:{self.bridge.port}"
+        if adb_ser:
+            return f"ADB:{adb_ser}"
+        return "нет связи (/bridge /adb)"
+
     def run_adb(
         self,
         args: list[str],
@@ -2370,17 +2732,59 @@ class PhoneController:
         timeout: int = 15,
         binary: bool = False,
         require_device: bool = True,
+        cancel_event: threading.Event | None = None,
     ) -> subprocess.CompletedProcess[Any]:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RequestCancelledError("Операция ADB отменена.")
         if not self.has_adb():
             raise RuntimeError("`adb` не установлен (pkg install android-tools).")
         cmd = ["adb"]
         if require_device:
             serial = self.active_adb_serial()
             if not serial:
-                raise RuntimeError("Нет ADB-устройств. Подключите командой `/adb`.")
+                raise RuntimeError(
+                    "Нет активного подключения к экрану: включите GemPhone Bridge в Спец. возможностях "
+                    "или подключите ADB командой `/adb`."
+                )
             cmd.extend(["-s", serial])
         cmd.extend(args)
-        return subprocess.run(cmd, capture_output=True, text=not binary, timeout=timeout)
+
+        if cancel_event is None:
+            return subprocess.run(cmd, capture_output=True, text=not binary, timeout=timeout)
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        res_box: list[subprocess.CompletedProcess[Any]] = []
+        err_box: list[BaseException] = []
+
+        def _wait_proc() -> None:
+            try:
+                out_b, err_b = proc.communicate(timeout=timeout)
+                out_val: Any = out_b if binary else out_b.decode("utf-8", errors="replace")
+                err_val: Any = err_b if binary else err_b.decode("utf-8", errors="replace")
+                res_box.append(subprocess.CompletedProcess(cmd, proc.returncode, out_val, err_val))
+            except BaseException as exc:  # noqa: BLE001
+                err_box.append(exc)
+
+        t = threading.Thread(target=_wait_proc, daemon=True)
+        t.start()
+        while t.is_alive():
+            if cancel_event.is_set():
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                raise RequestCancelledError("Операция ADB отменена пользователем.")
+            t.join(timeout=0.05)
+
+        if cancel_event.is_set():
+            raise RequestCancelledError("Операция ADB отменена пользователем.")
+        if err_box:
+            raise err_box[0]
+        return res_box[0]
 
     def run_termux_cmd(
         self,
@@ -2411,98 +2815,150 @@ class PhoneController:
     def get_screen_size(self) -> tuple[int, int]:
         if self._screen_size_cache is not None:
             return self._screen_size_cache
-        if self._use_bridge():
+        if self.has_bridge():
             try:
-                st = self.bridge.status()
-                w, h = int(st.get("width", 0)), int(st.get("height", 0))
+                info = self.bridge.status_info()
+                w, h = int(info.get("screen_width", 0)), int(info.get("screen_height", 0))
                 if w > 0 and h > 0:
                     self._screen_size_cache = (w, h)
                     return self._screen_size_cache
             except Exception:
-                if self.bridge_mode == "bridge":
-                    raise
-        proc = self.run_adb(["shell", "wm", "size"], timeout=8)
-        match = re.search(r"(\d+)\s*x\s*(\d+)", proc.stdout)
-        if match:
-            self._screen_size_cache = (int(match.group(1)), int(match.group(2)))
-            return self._screen_size_cache
+                pass
+        if self.active_adb_serial():
+            try:
+                proc = self.run_adb(["shell", "wm", "size"], timeout=8)
+                match = re.search(r"(\d+)\s*x\s*(\d+)", proc.stdout)
+                if match:
+                    self._screen_size_cache = (int(match.group(1)), int(match.group(2)))
+                    return self._screen_size_cache
+            except Exception:
+                pass
         return (1080, 2400)
 
     def get_foreground_app(self) -> str:
-        if self._use_bridge():
+        if self.has_bridge():
             try:
-                st = self.bridge.status()
-                app = str(st.get("app", "")).strip()
-                if app:
-                    return app
+                info = self.bridge.status_info()
+                pkg = str(info.get("foreground_package") or "").strip()
+                if pkg:
+                    return pkg
             except Exception:
-                if self.bridge_mode == "bridge":
-                    raise
-        proc = self.run_adb(["shell", "dumpsys", "window"], timeout=10)
-        for pattern in (
-            r"mCurrentFocus=Window\{[^\}]+\s+([^\s\}]+)\}",
-            r"mFocusedApp=[^\n]*ActivityRecord\{[^\}]+\s+([^\s\}]+)",
-        ):
-            m = re.search(pattern, proc.stdout)
-            if m:
-                return m.group(1)
+                pass
+        if self.active_adb_serial():
+            try:
+                proc = self.run_adb(["shell", "dumpsys", "window"], timeout=10)
+                for pattern in (
+                    r"mCurrentFocus=Window\{[^\}]+\s+([^\s\}]+)\}",
+                    r"mFocusedApp=[^\n]*ActivityRecord\{[^\}]+\s+([^\s\}]+)",
+                ):
+                    m = re.search(pattern, proc.stdout)
+                    if m:
+                        return m.group(1)
+            except Exception:
+                pass
         return "unknown"
 
-    def _dump_ui_via_bridge(self, *, only_interactive: bool = False) -> dict[str, Any]:
-        qs = "?only_interactive=1" if only_interactive else ""
-        data = self.bridge.request_json("GET", f"/ui{qs}", timeout=8.0)
-        nodes = data.get("elements") or []
+    def _parse_bridge_nodes(self, payload: dict[str, Any], *, only_interactive: bool = False) -> list[UiElement]:
+        raw_nodes = payload.get("nodes") or payload.get("elements") or []
+        if not isinstance(raw_nodes, list):
+            return []
         elements: list[UiElement] = []
-        for idx, n in enumerate(nodes[:60], start=1):
-            b = n.get("bounds") or [0, 0, 0, 0]
-            if len(b) != 4:
+        next_id = 1
+        for item in raw_nodes:
+            if not isinstance(item, dict):
                 continue
-            x1, y1, x2, y2 = int(b[0]), int(b[1]), int(b[2]), int(b[3])
+            bounds_raw = item.get("bounds")
+            x1 = y1 = x2 = y2 = 0
+            if isinstance(bounds_raw, list) and len(bounds_raw) == 4:
+                x1, y1, x2, y2 = (int(bounds_raw[i]) for i in range(4))
+            elif isinstance(bounds_raw, dict):
+                x1 = int(bounds_raw.get("left", 0))
+                y1 = int(bounds_raw.get("top", 0))
+                x2 = int(bounds_raw.get("right", 0))
+                y2 = int(bounds_raw.get("bottom", 0))
+            elif isinstance(bounds_raw, str):
+                m = self._BOUNDS_RE.match(bounds_raw)
+                if m:
+                    x1, y1, x2, y2 = (int(m.group(i)) for i in range(1, 5))
+
             if x2 <= x1 or y2 <= y1:
                 continue
+
+            text = str(item.get("text") or "").strip()
+            desc = str(item.get("content_desc") or item.get("desc") or "").strip()
+            res_id = str(item.get("resource_id") or item.get("id_name") or "").strip()
+            cls_name = str(item.get("class_name") or item.get("class") or "").strip()
+            clickable = bool(item.get("clickable", False))
+            scrollable = bool(item.get("scrollable", False))
+            focused = bool(item.get("focused", False))
+            editable = bool(item.get("editable", False)) or ("EditText" in cls_name or "AutoComplete" in cls_name)
+
+            is_interactive = clickable or scrollable or editable or focused
+            has_label = bool(text or desc)
+            if only_interactive and not is_interactive:
+                continue
+            if not (is_interactive or has_label):
+                continue
+
+            cx = int(item.get("center_x") if item.get("center_x") is not None else (x1 + x2) // 2)
+            cy = int(item.get("center_y") if item.get("center_y") is not None else (y1 + y2) // 2)
             elements.append(
                 UiElement(
-                    element_id=idx,
-                    text=str(n.get("text") or "").strip(),
-                    content_desc=str(n.get("contentDesc") or "").strip(),
-                    resource_id=str(n.get("resourceId") or "").strip(),
-                    class_name=str(n.get("className") or "").strip(),
-                    center_x=(x1 + x2) // 2,
-                    center_y=(y1 + y2) // 2,
+                    element_id=next_id,
+                    text=text,
+                    content_desc=desc,
+                    resource_id=res_id,
+                    class_name=cls_name,
+                    center_x=cx,
+                    center_y=cy,
                     bounds=(x1, y1, x2, y2),
-                    clickable=bool(n.get("clickable", False)),
-                    scrollable=bool(n.get("scrollable", False)),
-                    editable=bool(n.get("editable", False)),
-                    focused=bool(n.get("focused", False)),
+                    clickable=clickable,
+                    scrollable=scrollable,
+                    editable=editable,
+                    focused=focused,
+                    node_id=str(item.get("node_id") or ""),
                 )
             )
-        self.last_ui_elements = {e.element_id: e for e in elements}
-        screen = str(data.get("screen") or "")
-        if not screen:
-            w, h = self.get_screen_size()
-            screen = f"{w}x{h}"
-        return {
-            "transport": "bridge",
-            "screen": screen,
-            "app": str(data.get("app") or "unknown"),
-            "legend": "id:[c=click,in=input,sc=scroll] \"text\" #res @x,y",
-            "ui": "\n".join(e.to_compact_line() for e in elements),
-        }
+            next_id += 1
+            if len(elements) >= 60:
+                break
+        return elements
 
-    def dump_ui(self, *, only_interactive: bool = False) -> dict[str, Any]:
-        if self._use_bridge():
+    def dump_ui(self, *, only_interactive: bool = False, cancel_event: threading.Event | None = None) -> dict[str, Any]:
+        if self.has_bridge():
             try:
-                return self._dump_ui_via_bridge(only_interactive=only_interactive)
+                bdata = self.bridge.dump_ui(only_interactive=only_interactive)
+                if isinstance(bdata.get("ui"), str) and bdata["ui"].strip():
+                    w, h = self.get_screen_size()
+                    app_name = str(bdata.get("app") or bdata.get("package") or self.get_foreground_app())
+                    return {
+                        "via": "bridge",
+                        "screen": str(bdata.get("screen") or f"{w}x{h}"),
+                        "app": app_name,
+                        "legend": "id:[c=click,in=input,sc=scroll] \"text\" #res @x,y",
+                        "ui": bdata["ui"],
+                    }
+                elements = self._parse_bridge_nodes(bdata, only_interactive=only_interactive)
+                if elements:
+                    self.last_ui_elements = {e.element_id: e for e in elements}
+                    w, h = self.get_screen_size()
+                    app_name = str(bdata.get("app") or bdata.get("package") or self.get_foreground_app())
+                    return {
+                        "via": "bridge",
+                        "screen": str(bdata.get("screen") or f"{w}x{h}"),
+                        "app": app_name,
+                        "legend": "id:[c=click,in=input,sc=scroll] \"text\" #res @x,y",
+                        "ui": "\n".join(e.to_compact_line() for e in elements),
+                    }
             except Exception:
-                self.invalidate_transport_cache()
-                if self.bridge_mode == "bridge":
-                    raise
+                pass
+
         remote_path = "/sdcard/gemphone_ui.xml"
-        dump_proc = self.run_adb(["shell", "uiautomator", "dump", remote_path], timeout=20)
+        dump_proc = self.run_adb(["shell", "uiautomator", "dump", remote_path], timeout=20, cancel_event=cancel_event)
         if dump_proc.returncode != 0:
             raise RuntimeError(f"uiautomator dump failed: {(dump_proc.stderr or dump_proc.stdout).strip()}")
 
-        cat_proc = self.run_adb(["shell", "cat", remote_path], timeout=12)
+        cat_proc = self.run_adb(["shell", "cat", remote_path], timeout=12, cancel_event=cancel_event)
         xml_raw = cat_proc.stdout.strip()
         if not xml_raw.startswith("<"):
             xml_start = xml_raw.find("<?xml")
@@ -2512,7 +2968,7 @@ class PhoneController:
             raise RuntimeError("Пустой XML от uiautomator. Попробуйте adb_screenshot.")
 
         root = ET.fromstring(xml_raw)
-        elements: list[UiElement] = []
+        elements = []
         next_id = 1
 
         for node in root.iter("node"):
@@ -2564,6 +3020,7 @@ class PhoneController:
         self.last_ui_elements = {e.element_id: e for e in elements}
         w, h = self.get_screen_size()
         return {
+            "via": "adb",
             "screen": f"{w}x{h}",
             "app": self.get_foreground_app(),
             "legend": "id:[c=click,in=input,sc=scroll] \"text\" #res @x,y",
@@ -2577,34 +3034,36 @@ class PhoneController:
         max_dim: int | None = None,
         quality: int | None = None,
         hq: bool = False,
+        cancel_event: threading.Event | None = None,
     ) -> tuple[dict[str, Any], ImageAttachment]:
-        raw_png: bytes = b""
-        used_transport = "adb"
-        if self._use_bridge():
+        via = "adb"
+        raw_bytes: bytes = b""
+        mime_type = "image/jpeg"
+
+        if self.has_bridge():
             try:
-                raw_png = self.bridge.request_bytes("/screenshot", timeout=12.0)
-                if len(raw_png) >= 100:
-                    used_transport = "bridge"
+                raw_bytes, mime_type = self.bridge.capture_screenshot_bytes()
+                via = "bridge"
             except Exception:
-                raw_png = b""
-                if self.bridge_mode == "bridge":
-                    raise
-        if len(raw_png) < 100:
-            proc = self.run_adb(["exec-out", "screencap", "-p"], timeout=20, binary=True)
-            raw_png = proc.stdout
-            if proc.returncode != 0 or len(raw_png) < 100:
-                raise RuntimeError("Не удалось снять скриншот (FLAG_SECURE или обрыв ADB/Bridge).")
+                raw_bytes = b""
+
+        if not raw_bytes:
+            proc = self.run_adb(["exec-out", "screencap", "-p"], timeout=20, binary=True, cancel_event=cancel_event)
+            raw_bytes = proc.stdout
+            mime_type = "image/png"
+            via = "adb"
+            if proc.returncode != 0 or len(raw_bytes) < 100:
+                raise RuntimeError("Не удалось снять скриншот (FLAG_SECURE, нет доступа Bridge или обрыв ADB).")
 
         target_dim = SCREENSHOT_HQ_MAX_DIM if hq else (max_dim or self.screenshot_max_dim)
         target_qual = 92 if hq else (quality or self.screenshot_quality)
 
-        mime_type = "image/png"
-        out_bytes = raw_png
+        out_bytes = raw_bytes
         dimensions = "original"
 
         if HAS_PIL and Image is not None:
             try:
-                img = Image.open(io.BytesIO(raw_png))
+                img = Image.open(io.BytesIO(raw_bytes))
                 orig_w, orig_h = img.size
                 if max(orig_w, orig_h) > target_dim:
                     resampling = getattr(Image, "Resampling", Image).LANCZOS
@@ -2619,8 +3078,7 @@ class PhoneController:
                 mime_type = "image/jpeg"
                 dimensions = f"{img.size[0]}x{img.size[1]}"
             except Exception:
-                out_bytes = raw_png
-                mime_type = "image/png"
+                out_bytes = raw_bytes
 
         saved_to = ""
         if save_path is not None:
@@ -2631,7 +3089,7 @@ class PhoneController:
         b64 = base64.b64encode(out_bytes).decode("ascii")
         meta = {
             "ok": True,
-            "transport": used_transport,
+            "via": via,
             "app": self.get_foreground_app(),
             "dim": dimensions,
             "kb": round(len(out_bytes) / 1024, 1),
@@ -2649,32 +3107,36 @@ class PhoneController:
         duration_ms: int = 700,
     ) -> dict[str, Any]:
         label = ""
+        node_id = ""
         if element_id is not None:
             elem = self.last_ui_elements.get(element_id)
             if elem is None:
                 raise ValueError(f"Элемент id={element_id} не найден. Сначала вызовите adb_ui_dump.")
             x, y = elem.center_x, elem.center_y
+            node_id = elem.node_id
             label = elem.text or elem.content_desc or elem.resource_id
 
         if x is None or y is None:
             raise ValueError("Укажите element_id или x, y.")
 
-        dur = max(300, min(int(duration_ms), 4000)) if long_press else 60
-        action = f"long_press({dur}ms)" if long_press else "tap"
-        if self._use_bridge():
+        dur = max(300, min(int(duration_ms), 4000))
+        if self.has_bridge():
             try:
-                self.bridge.request_json("POST", "/tap", {"x": int(x), "y": int(y), "duration_ms": dur})
-                return {"ok": True, "transport": "bridge", "action": action, "x": x, "y": y, "label": label or None}
+                bres = self.bridge.tap(x=x, y=y, node_id=node_id, long_press=long_press, duration_ms=dur)
+                if bres.get("ok", True):
+                    action = f"long_press({dur}ms)" if long_press else "tap"
+                    return {"ok": True, "via": "bridge", "action": action, "x": x, "y": y, "label": label or None}
             except Exception:
-                self.invalidate_transport_cache()
-                if self.bridge_mode == "bridge":
-                    raise
+                pass
+
         if long_press:
             self.run_adb(["shell", "input", "swipe", str(x), str(y), str(x), str(y), str(dur)])
+            action = f"long_press({dur}ms)"
         else:
             self.run_adb(["shell", "input", "tap", str(x), str(y)])
+            action = "tap"
 
-        return {"ok": True, "transport": "adb", "action": action, "x": x, "y": y, "label": label or None}
+        return {"ok": True, "via": "adb", "action": action, "x": x, "y": y, "label": label or None}
 
     def swipe(
         self,
@@ -2704,31 +3166,26 @@ class PhoneController:
             raise ValueError("Укажите direction или x1, y1, x2, y2.")
 
         dur = max(50, min(int(duration_ms), 3000))
-        if self._use_bridge():
+        if self.has_bridge():
             try:
-                self.bridge.request_json(
-                    "POST",
-                    "/swipe",
-                    {"x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2), "duration_ms": dur},
-                )
-                return {"ok": True, "transport": "bridge", "from": [x1, y1], "to": [x2, y2]}
+                bres = self.bridge.swipe(x1=int(x1), y1=int(y1), x2=int(x2), y2=int(y2), duration_ms=dur)
+                if bres.get("ok", True):
+                    return {"ok": True, "via": "bridge", "from": [x1, y1], "to": [x2, y2]}
             except Exception:
-                self.invalidate_transport_cache()
-                if self.bridge_mode == "bridge":
-                    raise
+                pass
+
         self.run_adb(["shell", "input", "swipe", str(x1), str(y1), str(x2), str(y2), str(dur)])
-        return {"ok": True, "transport": "adb", "from": [x1, y1], "to": [x2, y2]}
+        return {"ok": True, "via": "adb", "from": [x1, y1], "to": [x2, y2]}
 
     def type_text(self, text: str, *, press_enter: bool = False) -> dict[str, Any]:
-        if self._use_bridge():
+        if self.has_bridge():
             try:
-                res = self.bridge.request_json("POST", "/type", {"text": text, "press_enter": press_enter})
-                if res.get("ok"):
-                    return {"ok": True, "transport": "bridge", "method": "accessibility_set_text", "chars": len(text)}
+                bres = self.bridge.type_text(text, press_enter=press_enter)
+                if bres.get("ok", True):
+                    return {"ok": True, "via": "bridge", "method": str(bres.get("method") or "accessibility"), "chars": len(text)}
             except Exception:
-                self.invalidate_transport_cache()
-                if self.bridge_mode == "bridge":
-                    raise
+                pass
+
         is_simple_ascii = bool(re.fullmatch(r"[A-Za-z0-9._:/@+-]+", text))
         method = "adb_input"
 
@@ -2748,21 +3205,30 @@ class PhoneController:
             time.sleep(0.1)
             self.run_adb(["shell", "input", "keyevent", "KEYCODE_ENTER"])
 
-        return {"ok": True, "method": method, "chars": len(text)}
+        return {"ok": True, "via": "adb", "method": method, "chars": len(text)}
 
     def keyevent(self, key: str) -> dict[str, Any]:
-        norm = key.strip().upper()
-        if self._use_bridge():
-            try:
-                res = self.bridge.request_json("POST", "/key", {"key": norm})
-                if res.get("ok"):
-                    return {"ok": True, "transport": "bridge", "keycode": norm}
-            except Exception:
-                if self.bridge_mode == "bridge":
-                    raise
-        keycode = ANDROID_KEYEVENTS.get(norm, norm)
+        upper = key.strip().upper()
+        keycode = ANDROID_KEYEVENTS.get(upper, upper)
+        if self.has_bridge():
+            global_map = {
+                "KEYCODE_BACK": "BACK",
+                "KEYCODE_HOME": "HOME",
+                "KEYCODE_APP_SWITCH": "RECENTS",
+                "KEYCODE_POWER": "POWER_DIALOG",
+                "KEYCODE_NOTIFICATION": "NOTIFICATIONS",
+            }
+            g_act = global_map.get(keycode)
+            if g_act:
+                try:
+                    bres = self.bridge.global_action(g_act)
+                    if bres.get("ok", True):
+                        return {"ok": True, "via": "bridge", "keycode": keycode}
+                except Exception:
+                    pass
+
         self.run_adb(["shell", "input", "keyevent", keycode])
-        return {"ok": True, "transport": "adb", "keycode": keycode}
+        return {"ok": True, "via": "adb", "keycode": keycode}
 
     def app_control(
         self,
@@ -2776,14 +3242,12 @@ class PhoneController:
         if act == "current":
             return {"app": self.get_foreground_app()}
         if act == "list":
-            if self._use_bridge():
-                try:
-                    return self.bridge.request_json("POST", "/app", {"action": "list", "query": query})
-                except Exception:
-                    if self.bridge_mode == "bridge":
-                        raise
-            proc = self.run_adb(["shell", "pm", "list", "packages", "-3"], timeout=12)
-            pkgs = [ln.replace("package:", "").strip() for ln in proc.stdout.splitlines() if ln.startswith("package:")]
+            if shutil.which("pm") is not None and not self.active_adb_serial():
+                proc = subprocess.run(["pm", "list", "packages", "-3"], capture_output=True, text=True, timeout=12)
+                pkgs = [ln.replace("package:", "").strip() for ln in proc.stdout.splitlines() if ln.startswith("package:")]
+            else:
+                proc = self.run_adb(["shell", "pm", "list", "packages", "-3"], timeout=12)
+                pkgs = [ln.replace("package:", "").strip() for ln in proc.stdout.splitlines() if ln.startswith("package:")]
             if query:
                 q = query.lower()
                 pkgs = [p for p in pkgs if q in p.lower()]
@@ -2792,35 +3256,33 @@ class PhoneController:
         if act == "launch":
             if not package:
                 raise ValueError("Укажите package.")
-            if self._use_bridge():
-                try:
-                    return self.bridge.request_json("POST", "/app", {"action": "launch", "package": package})
-                except Exception:
-                    if self.bridge_mode == "bridge":
-                        raise
-            proc = self.run_adb(["shell", "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1"], timeout=12)
-            return {"ok": proc.returncode == 0, "package": package}
+            if self.active_adb_serial():
+                proc = self.run_adb(["shell", "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1"], timeout=12)
+                return {"ok": proc.returncode == 0, "via": "adb", "package": package}
+            if shutil.which("monkey") is not None:
+                proc = subprocess.run(["monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1"], capture_output=True, text=True, timeout=12)
+                return {"ok": proc.returncode == 0, "via": "shell", "package": package}
+            raise RuntimeError("Для запуска приложений подключите ADB (/adb).")
         if act == "stop":
             if not package:
                 raise ValueError("Укажите package.")
             self.run_adb(["shell", "am", "force-stop", package], timeout=10)
-            return {"ok": True, "stopped": package}
+            return {"ok": True, "via": "adb", "stopped": package}
         if act == "open_url":
-            if not url or any(ch in url for ch in ("\n", "\r", "\x00")):
-                raise ValueError("Укажите корректный url.")
-            if self._use_bridge():
-                try:
-                    return self.bridge.request_json("POST", "/app", {"action": "open_url", "url": url})
-                except Exception:
-                    if self.bridge_mode == "bridge":
-                        raise
-            self.run_adb(["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", url])
-            return {"ok": True, "url": url}
+            if not url:
+                raise ValueError("Укажите url.")
+            if self.active_adb_serial():
+                self.run_adb(["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", url])
+                return {"ok": True, "via": "adb", "url": url}
+            if shutil.which("termux-open-url") is not None:
+                self.run_termux_cmd("termux-open-url", [url])
+                return {"ok": True, "via": "termux-api", "url": url}
+            raise RuntimeError("Не удалось открыть URL.")
         raise ValueError("action: current, list, launch, stop, open_url.")
 
 
 # ---------------------------------------------------------------------------
-# Единый реестр инструментов с компактными схемами и профилями (/mode)
+# Единый реестр инструментов с профилями (/mode)
 # ---------------------------------------------------------------------------
 
 
@@ -2863,19 +3325,6 @@ CODE_TOOLS: Final[frozenset[str]] = frozenset(
         "memory",
     }
 )
-
-
-try:
-    from safety import check_fetch_url, detect_destructive_command  # общая политика с gemcode
-    HAS_SAFETY = True
-except Exception:  # pragma: no cover — автономный запуск без пакета
-    HAS_SAFETY = False
-
-    def detect_destructive_command(command: str) -> str | None:
-        return None
-
-    def check_fetch_url(url: str) -> str | None:
-        return None if url.startswith(("http://", "https://")) else "разрешены только http(s)"
 
 
 class AgentToolkit:
@@ -2931,7 +3380,7 @@ class AgentToolkit:
         all_specs: list[dict[str, Any]] = [
             {
                 "name": "adb_status",
-                "description": "ADB connection status, screen size, foreground app.",
+                "description": "Screen control status (AccessibilityService Bridge / ADB), screen size, foreground app.",
                 "parameters": {"type": "object", "properties": {}},
             },
             {
@@ -2947,10 +3396,7 @@ class AgentToolkit:
                 "description": "Capture phone screenshot for visual inspection (set hq=true to read small text clearly).",
                 "parameters": {
                     "type": "object",
-                    "properties": {
-                        "save_as": {"type": "string"},
-                        "hq": {"type": "boolean"},
-                    },
+                    "properties": {"save_as": {"type": "string"}, "hq": {"type": "boolean"}},
                 },
             },
             {
@@ -2986,10 +3432,7 @@ class AgentToolkit:
                 "description": "Type text (supports Cyrillic/Unicode) into focused field.",
                 "parameters": {
                     "type": "object",
-                    "properties": {
-                        "text": {"type": "string"},
-                        "press_enter": {"type": "boolean"},
-                    },
+                    "properties": {"text": {"type": "string"}, "press_enter": {"type": "boolean"}},
                     "required": ["text"],
                 },
             },
@@ -3060,10 +3503,7 @@ class AgentToolkit:
                 "description": "Get or set Android clipboard.",
                 "parameters": {
                     "type": "object",
-                    "properties": {
-                        "action": {"type": "string", "enum": ["get", "set"]},
-                        "text": {"type": "string"},
-                    },
+                    "properties": {"action": {"type": "string", "enum": ["get", "set"]}, "text": {"type": "string"}},
                     "required": ["action"],
                 },
             },
@@ -3199,12 +3639,10 @@ class AgentToolkit:
         safe_args = args if isinstance(args, dict) else {}
         try:
             return handler(safe_args)
-        except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+        except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired, RequestCancelledError) as exc:
             return ToolExecutionResult({"error": str(exc)})
         except Exception as exc:
             return ToolExecutionResult({"error": f"Ошибка {name}: {exc}"})
-
-    # --- Безопасность и подтверждение ---
 
     def _confirm(self, summary: str, *, risk: RiskLevel) -> tuple[bool, str]:
         if risk == "safe":
@@ -3216,40 +3654,46 @@ class AgentToolkit:
         if self.policy.non_interactive:
             return False, "Отклонено: неинтерактивный режим без --yolo."
 
-        badge = "⚠️ ОПАСНОЕ ДЕЙСТВИЕ" if risk == "dangerous" else "Подтверждение"
-        opts = (
-            "[y] Да / [n] Нет / [a] Разрешать опасные"
-            if risk == "dangerous"
-            else "[y] Да / [n] Нет / [a] Всегда (экран/файлы)"
+        title = "Опасное действие" if risk == "dangerous" else "Подтверждение"
+        all_lbl = "разрешать все опасные в сессии" if risk == "dangerous" else "разрешать все правки/тапы в сессии"
+        self.ui.panel(
+            title,
+            f"{summary}\n\n"
+            f"  [1 / y] Да, выполнить\n"
+            f"  [2 / a] Да, и {all_lbl}\n"
+            f"  [3 / n] Нет, отменить",
+            style="red" if risk == "dangerous" else "yellow",
         )
-        self.ui.warn(f"{badge}: {summary}\n  {opts}")
         if self.notifier is not None:
             self.notifier.notify_attention(summary)
         try:
             if self.active_monitor is not None:
                 with self.active_monitor.suspend():
-                    ans = input("  Выбор > ").strip().lower()
+                    ans = input("  ❯ ").strip().lower()
             else:
-                ans = input("  Выбор > ").strip().lower()
+                ans = input("  ❯ ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return False, "Отменено пользователем."
 
-        if ans in ("y", "yes", "д", "да"):
+        if ans in ("1", "y", "yes", "д", "да"):
             return True, ""
-        if ans in ("a", "always", "в", "всегда"):
+        if ans in ("2", "a", "always", "в", "всегда"):
             if risk == "dangerous":
                 self.policy.auto_approve_dangerous = True
             else:
                 self.policy.auto_approve_moderate = True
-            self.ui.dim("  -> Автоподтверждение включено до конца сессии.")
+            self.ui.dim("  ⎿ Автоподтверждение включено до конца сессии.")
             return True, ""
         return False, f"Пользователь отклонил действие ('{ans or 'n'}')."
 
     def _resolve_safe_path(self, raw_path: str) -> Path:
-        candidate = (self.workspace / raw_path).resolve()
+        cleaned = raw_path.strip()
+        if not cleaned:
+            raise ValueError("Путь не может быть пустым.")
+        candidate = (self.workspace / cleaned).resolve()
         if not candidate.is_relative_to(self.workspace):
-            raise ValueError(f"Путь '{raw_path}' выходит за пределы {self.workspace}")
+            raise ValueError(f"Путь '{raw_path}' выходит за пределы рабочей папки {self.workspace}")
         return candidate
 
     def _rel(self, path: Path) -> str:
@@ -3274,46 +3718,44 @@ class AgentToolkit:
                 tmp_path.unlink(missing_ok=True)
             target.write_text(content, encoding="utf-8")
 
-    # --- ADB-инструменты ---
+    # --- Инструменты экрана и ввода (Bridge / ADB) ---
 
     def _tool_adb_status(self, _args: dict[str, Any]) -> ToolExecutionResult:
-        kind, label = self.phone.active_transport(force_refresh=True)
+        bridge_ok = self.phone.has_bridge(force=True)
+        active = self.phone.active_adb_serial(force=True)
         info: dict[str, Any] = {
-            "transport": kind,
-            "label": label,
-            "bridge_available": kind == "bridge",
+            "bridge_connected": bridge_ok,
+            "bridge_unauthorized": self.phone.bridge._last_unauthorized,
             "adb_installed": self.phone.has_adb(),
+            "adb_connected": active is not None,
+            "device": active,
+            "transport": self.phone.transport_badge(force=False),
         }
-        if kind == "bridge":
-            info["connected"] = True
-            w, h = self.phone.get_screen_size()
-            info["screen"] = f"{w}x{h}"
-            info["app"] = self.phone.get_foreground_app()
-            return ToolExecutionResult(info)
-        active = self.phone.active_adb_serial() if self.phone.has_adb() else None
-        info["connected"] = active is not None
-        info["device"] = active
-        if active:
+        if bridge_ok or active:
             w, h = self.phone.get_screen_size()
             info["screen"] = f"{w}x{h}"
             info["app"] = self.phone.get_foreground_app()
         return ToolExecutionResult(info)
 
     def _tool_adb_ui_dump(self, args: dict[str, Any]) -> ToolExecutionResult:
-        return ToolExecutionResult(self.phone.dump_ui(only_interactive=bool(args.get("only_interactive", False))))
+        cancel_ev = self.active_monitor.event if self.active_monitor is not None else None
+        return ToolExecutionResult(
+            self.phone.dump_ui(only_interactive=bool(args.get("only_interactive", False)), cancel_event=cancel_ev)
+        )
 
     def _tool_adb_screenshot(self, args: dict[str, Any]) -> ToolExecutionResult:
         save_as = str(args.get("save_as", "")).strip()
         save_path = self._resolve_safe_path(save_as) if save_as else None
         hq = bool(args.get("hq", False))
-        meta, image = self.phone.capture_screenshot(save_path=save_path, hq=hq)
+        cancel_ev = self.active_monitor.event if self.active_monitor is not None else None
+        meta, image = self.phone.capture_screenshot(save_path=save_path, hq=hq, cancel_event=cancel_ev)
         return ToolExecutionResult(meta, image=image)
 
     def _tool_adb_tap(self, args: dict[str, Any]) -> ToolExecutionResult:
         el_id, x, y = args.get("element_id"), args.get("x"), args.get("y")
         lp = bool(args.get("long_press", False))
         desc = f"id={el_id}" if el_id is not None else f"({x},{y})"
-        ok, reason = self._confirm(f"ADB {'долгое нажатие' if lp else 'тап'} {desc}", risk="moderate")
+        ok, reason = self._confirm(f"{'Долгое нажатие' if lp else 'Тап'} {desc}", risk="moderate")
         if not ok:
             return ToolExecutionResult({"rejected": reason})
         return ToolExecutionResult(
@@ -3328,7 +3770,7 @@ class AgentToolkit:
     def _tool_adb_swipe(self, args: dict[str, Any]) -> ToolExecutionResult:
         direction = args.get("direction")
         desc = f"{direction}" if direction else f"({args.get('x1')},{args.get('y1')})->({args.get('x2')},{args.get('y2')})"
-        ok, reason = self._confirm(f"ADB свайп: {desc}", risk="moderate")
+        ok, reason = self._confirm(f"Свайп: {desc}", risk="moderate")
         if not ok:
             return ToolExecutionResult({"rejected": reason})
         return ToolExecutionResult(
@@ -3361,9 +3803,12 @@ class AgentToolkit:
         package = str(args.get("package", "")).strip()
         query = str(args.get("query", "")).strip()
         url = str(args.get("url", "")).strip()
-        if action in ("launch", "stop", "open_url"):
-            risk: RiskLevel = "dangerous" if action == "open_url" else "moderate"
-            ok, reason = self._confirm(f"Android {action}: {package or url}", risk=risk)
+        if action == "open_url":
+            ok, reason = self._confirm(f"Открыть URL: {url}", risk="dangerous")
+            if not ok:
+                return ToolExecutionResult({"rejected": reason})
+        elif action in ("launch", "stop"):
+            ok, reason = self._confirm(f"Действие с приложением ({action}): {package}", risk="moderate")
             if not ok:
                 return ToolExecutionResult({"rejected": reason})
         return ToolExecutionResult(self.phone.app_control(action, package=package, query=query, url=url))
@@ -3391,7 +3836,8 @@ class AgentToolkit:
         action = str(args.get("action", "")).lower()
         value = str(args.get("value", "")).strip()
         stream = str(args.get("stream", "music")).lower()
-        ok, reason = self._confirm(f"Телефон: {action} = {value}", risk="moderate")
+        risk: RiskLevel = "dangerous" if action == "open_url" else "moderate"
+        ok, reason = self._confirm(f"Телефон: {action} = {value}", risk=risk)
         if not ok:
             return ToolExecutionResult({"rejected": reason})
 
@@ -3423,11 +3869,7 @@ class AgentToolkit:
             items = self.phone.run_termux_cmd("termux-notification-list", parse_json=True)
             if isinstance(items, list):
                 compact = [
-                    {
-                        "app": it.get("packageName"),
-                        "title": it.get("title"),
-                        "text": str(it.get("content", ""))[:120],
-                    }
+                    {"app": it.get("packageName"), "title": it.get("title"), "text": str(it.get("content", ""))[:120]}
                     for it in items[:20]
                 ]
                 return ToolExecutionResult({"count": len(items), "items": compact})
@@ -3562,7 +4004,7 @@ class AgentToolkit:
         return ToolExecutionResult({"count": len(entries), "entries": entries})
 
     def _tool_read_file(self, args: dict[str, Any]) -> ToolExecutionResult:
-        rel = str(args.get("path", ""))
+        rel = str(args.get("path", "")).strip()
         target = self._resolve_safe_path(rel)
         if not target.exists() or not target.is_file():
             return ToolExecutionResult({"error": f"Файл не найден: {rel}"})
@@ -3623,7 +4065,7 @@ class AgentToolkit:
         return ToolExecutionResult({"count": len(matches), "matches": matches})
 
     def _tool_edit_file(self, args: dict[str, Any]) -> ToolExecutionResult:
-        rel, old_text, new_text = str(args.get("path", "")), str(args.get("old_text", "")), str(args.get("new_text", ""))
+        rel, old_text, new_text = str(args.get("path", "")).strip(), str(args.get("old_text", "")), str(args.get("new_text", ""))
         target = self._resolve_safe_path(rel)
         if not target.exists() or not target.is_file():
             return ToolExecutionResult({"error": f"Файл не найден: {rel}"})
@@ -3633,63 +4075,93 @@ class AgentToolkit:
             return ToolExecutionResult({"error": f"old_text найден {cnt} раз(а); нужен ровно 1."})
         updated = original.replace(old_text, new_text, 1)
         rel_lbl = self._rel(target)
-        self.ui.info(f"\nПравка: {rel_lbl}")
         self.ui.diff(original, updated, rel_lbl)
         ok, reason = self._confirm(f"Применить правку в {rel_lbl}?", risk="moderate")
         if not ok:
             return ToolExecutionResult({"rejected": reason})
         self._atomic_write(target, updated)
-        self.ui.success(f"  ✓ Обновлено: {rel_lbl}")
         return ToolExecutionResult({"ok": True, "path": rel_lbl})
 
     def _tool_write_file(self, args: dict[str, Any]) -> ToolExecutionResult:
         rel, content = str(args.get("path", "")).strip(), str(args.get("content", ""))
-        if not rel or rel in (".", "./"):
-            return ToolExecutionResult({"error": "Укажите непустой путь к файлу."})
+        if not rel:
+            return ToolExecutionResult({"error": "Параметр path обязателен."})
         target = self._resolve_safe_path(rel)
         if target.exists() and target.is_dir():
-            return ToolExecutionResult({"error": f"'{rel}' — это директория, а не файл."})
+            return ToolExecutionResult({"error": f"Путь является директорией: {rel}"})
         rel_lbl = self._rel(target)
         old_content = target.read_text(encoding="utf-8", errors="replace") if target.exists() and target.is_file() else ""
-        self.ui.info(f"\nФайл: {rel_lbl}")
         self.ui.diff(old_content, content, rel_lbl)
         ok, reason = self._confirm(f"Записать {rel_lbl}?", risk="moderate")
         if not ok:
             return ToolExecutionResult({"rejected": reason})
         self._atomic_write(target, content)
-        self.ui.success(f"  ✓ Сохранено: {rel_lbl}")
         return ToolExecutionResult({"ok": True, "path": rel_lbl})
 
     def _tool_run_command(self, args: dict[str, Any]) -> ToolExecutionResult:
         command = str(args.get("command", "")).strip()
         if not command:
             return ToolExecutionResult({"error": "Пустая команда."})
+        for bad_pat in DANGEROUS_CMD_PATTERNS:
+            if bad_pat.search(command):
+                return ToolExecutionResult({"error": "Команда заблокирована фильтром безопасности."})
         timeout = max(1, min(int(args.get("timeout", DEFAULT_CMD_TIMEOUT)), 120))
-        blocked = detect_destructive_command(command)
-        if blocked:
-            return ToolExecutionResult({"error": f"Команда отклонена политикой безопасности: {blocked}"})
-        self.ui.panel("Команда", f"$ {command}", style="magenta")
-        ok, reason = self._confirm("Выполнить в Termux?", risk="dangerous")
+        ok, reason = self._confirm(f"Выполнить в Termux:\n$ {command}", risk="dangerous")
         if not ok:
             return ToolExecutionResult({"rejected": reason})
-        proc = subprocess.run(command, shell=True, cwd=self.workspace, capture_output=True, text=True, timeout=timeout)
-        stdout = truncate_text(proc.stdout.strip(), MAX_TOOL_OUTPUT_CHARS // 2)
-        stderr = truncate_text(proc.stderr.strip(), MAX_TOOL_OUTPUT_CHARS // 2)
-        if proc.returncode == 0:
-            self.ui.success("  -> exit 0")
-        else:
-            self.ui.error(f"  -> exit {proc.returncode}")
-        if stdout:
-            self.ui.dim(stdout[:350] + ("..." if len(stdout) > 350 else ""))
-        if stderr:
-            self.ui.error(stderr[:350] + ("..." if len(stderr) > 350 else ""))
+
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=self.workspace,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        out_box: list[tuple[str, str]] = []
+        err_box: list[BaseException] = []
+
+        def _comm() -> None:
+            try:
+                o, e = proc.communicate(timeout=timeout)
+                out_box.append((o or "", e or ""))
+            except BaseException as exc:  # noqa: BLE001
+                err_box.append(exc)
+
+        t = threading.Thread(target=_comm, daemon=True)
+        t.start()
+        while t.is_alive():
+            if self.active_monitor is not None and self.active_monitor.is_cancelled():
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                raise RequestCancelledError("Команда отменена пользователем.")
+            t.join(timeout=0.05)
+
+        if self.active_monitor is not None and self.active_monitor.is_cancelled():
+            raise RequestCancelledError("Команда отменена пользователем.")
+        if err_box:
+            if isinstance(err_box[0], subprocess.TimeoutExpired):
+                return ToolExecutionResult({"error": f"Команда превысила таймаут {timeout} с."})
+            raise err_box[0]
+
+        raw_out, raw_err = out_box[0] if out_box else ("", "")
+        stdout = truncate_text(raw_out.strip(), MAX_TOOL_OUTPUT_CHARS // 2)
+        stderr = truncate_text(raw_err.strip(), MAX_TOOL_OUTPUT_CHARS // 2)
+        self.phone.invalidate_adb_cache()
         return ToolExecutionResult({"code": proc.returncode, "stdout": stdout, "stderr": stderr})
 
     def _tool_web_fetch(self, args: dict[str, Any]) -> ToolExecutionResult:
         url = str(args.get("url", "")).strip()
-        blocked_reason = check_fetch_url(url)
-        if blocked_reason:
-            return ToolExecutionResult({"error": f"URL отклонён: {blocked_reason}"})
+        if not url.startswith(("http://", "https://")):
+            return ToolExecutionResult({"error": "Нужен http:// или https://"})
         status, ctype, body = _http_get_text(url)
         if "html" in ctype.lower():
             parser = _HtmlTextExtractor()
@@ -3716,7 +4188,7 @@ class AgentToolkit:
 
 
 # ---------------------------------------------------------------------------
-# Ядро цикла агента с контролем бюджета токенов
+# Ядро цикла агента с древовидным выводом и контролем бюджета токенов
 # ---------------------------------------------------------------------------
 
 
@@ -3771,11 +4243,10 @@ class PhoneAgent:
             with monitor:
                 for step in range(1, self.max_steps + 1):
                     _check_cancel()
-                    label = (
-                        f"Думаю ({self.client.provider_name}/{self.client.model}, "
-                        f"шаг {step}/{self.max_steps}) [ESC — отмена]..."
-                    )
-                    with self.ui.status(label):
+                    sub = f"шаг {step}/{self.max_steps}"
+                    if turn_tokens > 0:
+                        sub += f" · {format_tokens(turn_tokens)} ток."
+                    with self.ui.thinking("Думаю…", sub):
                         turn = self.client.generate_step(
                             tool_specs=specs,
                             system_instruction=sys_prompt,
@@ -3790,13 +4261,6 @@ class PhoneAgent:
                         completion=turn.completion_tokens,
                         total=step_total,
                     )
-
-                    if step_total > 0:
-                        self.ui.dim(
-                            f"  [шаг {step}: +{format_tokens(step_total)} ток. "
-                            f"(вход {format_tokens(turn.prompt_tokens)} / выход {format_tokens(turn.completion_tokens)}) "
-                            f"| запрос: {format_tokens(turn_tokens)}]"
-                        )
 
                     if not turn.tool_calls:
                         elapsed = time.perf_counter() - started_at
@@ -3819,20 +4283,20 @@ class PhoneAgent:
                         if turn.prompt_tokens > 30_000:
                             self.ui.warn(
                                 f"  Совет: контекст вырос до {format_tokens(turn.prompt_tokens)} токенов — "
-                                "введите /clear, чтобы не переплачивать в следующих сообщениях."
+                                "введите /clear, чтобы не переплачивать."
                             )
                         return turn.text
 
                     if budget_limit > 0 and turn_tokens >= budget_limit and not self.toolkit.policy.non_interactive:
                         self.ui.warn(
-                            f"\n⚠️ Лимит экономии: этот запрос уже потратил {format_tokens(turn_tokens)} токенов "
+                            f"\n⚠️ Лимит экономии: запрос потратил {format_tokens(turn_tokens)} токенов "
                             f"(бюджет: {format_tokens(budget_limit)})."
                         )
                         self.notifier.notify_attention(
                             f"Лимит экономии: {format_tokens(turn_tokens)} ток. Подтвердите продолжение в Termux."
                         )
                         with monitor.suspend():
-                            ans = input("  Продолжить выполнение ещё на один блок? [y/N] > ").strip().lower()
+                            ans = input("  Продолжить ещё на один блок? [y/N] ❯ ").strip().lower()
                         if ans not in ("y", "yes", "д", "да"):
                             elapsed = time.perf_counter() - started_at
                             self.client.finalize_turn()
@@ -3851,30 +4315,17 @@ class PhoneAgent:
                         self.ui.dim(turn.text)
 
                     results: list[tuple[ToolCall, ToolExecutionResult]] = []
-                    _SPIN_TOOLS = frozenset({"adb_status", "adb_ui_dump", "adb_screenshot", "web_fetch", "search_text"})
                     for call in turn.tool_calls:
                         _check_cancel()
-                        self.ui.tool_badge(call.name, call.args)
-                        if call.name in _SPIN_TOOLS:
-                            with self.ui.status(f"Выполняю {call.name}..."):
-                                res = self.toolkit.execute(call.name, call.args)
-                        else:
+                        t0 = time.perf_counter()
+                        with self.ui.running_tool(call.name, call.args):
                             res = self.toolkit.execute(call.name, call.args)
+                        dt = time.perf_counter() - t0
                         _check_cancel()
-                        payload = res.payload
-                        if isinstance(payload, dict):
-                            if "error" in payload:
-                                self.ui.tool_result(f"ошибка: {payload['error']}", ok=False)
-                            elif "rejected" in payload:
-                                self.ui.tool_result(f"отклонено: {payload['rejected']}", ok=False)
-                            elif "ui" in payload:
-                                lines_n = len([ln for ln in str(payload["ui"]).splitlines() if ln.strip()])
-                                self.ui.tool_result(f"{payload.get('app', '')} · {lines_n} элем. ({payload.get('transport', 'adb')})")
-                            elif "dim" in payload and "kb" in payload:
-                                self.ui.tool_result(f"скриншот {payload['dim']} · {payload['kb']} KB ({payload.get('transport', 'adb')})")
-                            else:
-                                compact = ", ".join(f"{k}={v}" for k, v in list(payload.items())[:4])
-                                self.ui.tool_result(compact or "ok")
+                        status, summary = _summarize_tool_result(call.name, res.payload, dt)
+                        if step_total > 0 and call is turn.tool_calls[-1]:
+                            summary = f"{summary} · +{format_tokens(step_total)} ток."
+                        self.ui.tool_tree_result(call.name, call.args, status, summary)
                         results.append((call, res))
 
                     self.client.add_tool_results(results)
@@ -3915,7 +4366,7 @@ class PhoneAgent:
 
 
 # ---------------------------------------------------------------------------
-# Интерактивные мастера (включая /login по подписке) и CLI
+# Интерактивные мастера (включая /login по подписке и /bridge) и CLI
 # ---------------------------------------------------------------------------
 
 
@@ -3949,20 +4400,73 @@ def ensure_api_key(
     return entered
 
 
+def handle_bridge_command(agent: PhoneAgent, arg: str) -> None:
+    ui = agent.ui
+    bridge = agent.toolkit.phone.bridge
+    parts = arg.strip().split(maxsplit=1)
+    sub = parts[0].lower() if parts else ""
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if sub == "token" and rest:
+        bridge.save_token(rest)
+        agent.toolkit.phone.invalidate_adb_cache()
+        ok = bridge.is_available(force=True)
+        ui.success(f"✓ Токен Bridge сохранён в {bridge.token_path} ({mask_secret(rest)}).")
+        if ok:
+            ui.success(f"✓ Мост {bridge.base_url()} отвечает!")
+        elif bridge._last_unauthorized:
+            ui.warn(
+                f"Мост {bridge.base_url()} запущен, но вернул 401 (неверный токен). "
+                "Нажмите «2. Скопировать команду для GemPhone» в приложении GemPhone Bridge и вставьте сюда."
+            )
+        else:
+            ui.warn("Мост пока не отвечает: откройте приложение GemPhone Bridge и включите его в Спец. возможностях.")
+        return
+
+    if sub == "check":
+        ok = bridge.is_available(force=True)
+        if ok:
+            info = bridge.status_info()
+            ui.success(
+                f"✓ GemPhone Bridge активен на {bridge.base_url()} "
+                f"(экран: {info.get('screen_width', '?')}x{info.get('screen_height', '?')}, "
+                f"окно: {info.get('foreground_package', '?')})"
+            )
+        elif bridge._last_unauthorized:
+            ui.warn(
+                f"Мост {bridge.base_url()} отвечает, но отклонил токен (401 Unauthorized). "
+                "Обновите токен через `/bridge token <токен>` из приложения GemPhone Bridge."
+            )
+        else:
+            ui.warn(f"GemPhone Bridge не отвечает на {bridge.base_url()}.")
+        return
+
+    active = bridge.is_available(force=True)
+    status_line = "● АКТИВЕН" if active else ("! 401 неверный токен" if bridge._last_unauthorized else "○ не подключён")
+    ui.panel(
+        "AccessibilityService Bridge (работа без ADB и Wi-Fi)",
+        f"Статус      : {status_line}\n"
+        f"Адрес       : {bridge.base_url()}\n"
+        f"Токен       : {mask_secret(bridge.token)} ({bridge.token_path})\n\n"
+        "1. Установите APK GemPhone Bridge (собранный из папки bridge/).\n"
+        "2. Включите GemPhone Bridge в Настройки -> Спец. возможности\n"
+        "   (на Android 13+ сначала через кнопку 0 и меню ⋮ -> Разрешить огр. настройки).\n"
+        "3. Скопируйте в приложении команду `/bridge token <токен>` и вставьте сюда.\n"
+        "   Проверка связи: `/bridge check`",
+        style="green" if active else "yellow",
+    )
+
+
 def interactive_subscription_login(agent: PhoneAgent, target_name: str = "") -> None:
-    """Помогает установить официальный CLI и войти в подписку через OAuth в браузере."""
     ui = agent.ui
     name = target_name.lower().strip()
     if not name:
         ui.panel(
-            "Подключение подписок (OAuth без API-ключа)",
-            "Доступные подписки:\n"
-            "  • /login gemini-sub   — Google / Gemini AI Pro (через Gemini CLI)\n"
-            "  • /login claude-sub   — Claude Pro / Max (через Claude Code CLI)\n"
-            "  • /login chatgpt-sub  — ChatGPT Plus / Pro (через OpenAI Codex CLI)\n\n"
-            "Для них нужен Node.js в Termux: pkg install nodejs -y\n"
-            "После входа переключитесь командой: /use claude-sub (или gemini-sub / chatgpt-sub).",
-            style="green",
+            "Подписки (OAuth без API-ключа)",
+            "  /login gemini-sub   — Google / Gemini AI Pro\n"
+            "  /login claude-sub   — Claude Pro / Max\n"
+            "  /login chatgpt-sub  — ChatGPT Plus / Pro\n\n"
+            "Нужен Node.js в Termux: pkg install nodejs -y",
         )
         return
 
@@ -3976,18 +4480,17 @@ def interactive_subscription_login(agent: PhoneAgent, target_name: str = "") -> 
     if shutil.which(binary) is None:
         ui.warn(f"Утилита `{binary}` пока не установлена.")
         if shutil.which("npm") is None:
-            ui.info("Сначала установите Node.js в Termux:\n  pkg install nodejs -y")
+            ui.info("Сначала установите Node.js в Termux: pkg install nodejs -y")
         if hint:
-            ui.info(f"Затем установите официальный CLI:\n  {hint[0]}")
+            ui.info(f"Команда установки: {hint[0]}")
             try:
-                ans = input("Установить сейчас автоматически через npm? [y/N] > ").strip().lower()
+                ans = input("Установить сейчас через npm? [y/N] ❯ ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 return
             if ans in ("y", "yes", "д", "да"):
                 if shutil.which("npm") is None:
                     ui.error("npm не найден. Выполните `pkg install nodejs -y` и повторите `/login`.")
                     return
-                ui.info(f"Выполняю: {hint[0]} ...")
                 res = subprocess.run(shlex.split(hint[0]))
                 if res.returncode != 0:
                     ui.error("Не удалось установить через npm.")
@@ -3996,7 +4499,7 @@ def interactive_subscription_login(agent: PhoneAgent, target_name: str = "") -> 
                 return
 
     login_cmd = hint[1] if hint else binary
-    ui.info(f"Запускаю авторизацию OAuth (`{login_cmd}`). После входа вернётесь в GemPhone...")
+    ui.info(f"Запускаю OAuth (`{login_cmd}`)…")
     try:
         subprocess.run(shlex.split(login_cmd))
     except Exception as exc:
@@ -4006,13 +4509,13 @@ def interactive_subscription_login(agent: PhoneAgent, target_name: str = "") -> 
     agent.store.active_provider = name
     agent.store.save()
     agent.switch_client(create_llm_client(cfg, ""), preserve_context=True)
-    ui.success(f"✓ Подписка '{name}' активирована! Можете писать запросы.")
+    ui.success(f"✓ Подписка '{name}' активирована.")
 
 
 def print_status_report(agent: PhoneAgent) -> None:
     phone = agent.toolkit.phone
-    transport_kind, transport_label = phone.active_transport(force_refresh=True)
-    active_adb = phone.active_adb_serial()
+    bridge_ok = phone.has_bridge(force=True)
+    active_adb = phone.active_adb_serial(force=True)
     n = agent.notifier
     notify_state = (
         f"ВКЛ (вибр/тост/шторка{', TTS' if n.tts else ''})"
@@ -4024,22 +4527,27 @@ def print_status_report(agent: PhoneAgent) -> None:
         for name in ("gemini-sub", "claude-sub", "chatgpt-sub")
         if (c := agent.store.get(name)) and shutil.which(c.cli_binary()) is not None
     ]
+    bridge_status_str = (
+        "АКТИВЕН"
+        if bridge_ok
+        else ("401 неверный токен" if phone.bridge._last_unauthorized else f"нет (токен: {mask_secret(phone.bridge.token)})")
+    )
     rows = [
         ["API / Подписка", f"{agent.client.provider_name} ({agent.client.config.provider_type})"],
         ["Модель", f"{agent.client.model} (Vision: {'да' if agent.client.config.supports_vision else 'нет'})"],
         ["Подписки CLI", ", ".join(subs_ready) if subs_ready else "не установлены (/login)"],
         ["Качество скринов", f"{phone.screenshot_max_dim}px, JPEG {phone.screenshot_quality}% (/quality)"],
         ["Режим инструментов", f"{agent.toolkit.mode} ({len(agent.toolkit.tool_specs())} шт.)"],
-        ["Бюджет / Шаги", f"{format_tokens(agent.turn_token_budget)} ток. на запрос / макс {agent.max_steps} шагов"],
+        ["Бюджет / Шаги", f"{format_tokens(agent.turn_token_budget)} ток. / макс {agent.max_steps} шагов"],
         ["Оповещения (/notify)", notify_state],
-        ["Транспорт экрана", f"{transport_label} (режим: {phone.bridge_mode}, /bridge)"],
+        ["Bridge (127.0.0.1:7331)", bridge_status_str],
         ["ADB (резерв)", f"Подключён: {active_adb}" if active_adb else ("Установлен, нет устройств (/adb)" if phone.has_adb() else "НЕ установлен")],
         ["Termux:API", "Доступен" if phone.has_termux_api() else "НЕ найден"],
         ["Библиотеки", f"rich={'OK' if HAS_RICH else '-'}, httpx={'OK' if HAS_HTTPX else '-'}, PIL={'OK' if HAS_PIL else '-'}, ptk={'OK' if HAS_PROMPT_TOOLKIT else '-'}"],
         ["Память фактов", f"{len(agent.memory.data)} записей"],
         ["Рабочая папка", str(agent.toolkit.workspace)],
     ]
-    agent.ui.table("Диагностика GemPhone", ["Компонент", "Статус"], rows)
+    agent.ui.table(f"Диагностика GemPhone {APP_VERSION}", ["Компонент", "Статус"], rows)
 
 
 def interactive_adb_wizard(agent: PhoneAgent) -> None:
@@ -4052,11 +4560,11 @@ def interactive_adb_wizard(agent: PhoneAgent) -> None:
     ui.panel(
         "Мастер подключения ADB (Wireless Debugging)",
         "1. Включите Wi-Fi и откройте: Настройки -> Для разработчиков -> Отладка по Wi-Fi.\n"
-        "2. Откройте Настройки и Termux в разделённом экране (чтобы порт не менялся).\n"
+        "2. Откройте Настройки и Termux в разделённом экране.\n"
         "3. Сначала [1] Сопряжение (pair), затем [2] Подключение (connect).",
         style="yellow",
     )
-    devs = phone.adb_devices()
+    devs = phone.adb_devices(force=True)
     if devs:
         ui.info("Устройства ADB: " + ", ".join(f"{d['serial']} ({d['state']})" for d in devs))
 
@@ -4065,23 +4573,26 @@ def interactive_adb_wizard(agent: PhoneAgent) -> None:
     print("  [3] Перезапустить ADB-сервер")
     print("  [Enter] Выход")
     try:
-        choice = input("  Выбор > ").strip()
+        choice = input("  ❯ ").strip()
         if choice == "1":
             port = input("  Порт сопряжения: ").strip()
             code = input("  6-значный код: ").strip()
             if port and code:
                 addr = port if ":" in port else f"127.0.0.1:{port}"
                 proc = subprocess.run(["adb", "pair", addr, code], capture_output=True, text=True, timeout=15)
+                phone.invalidate_adb_cache()
                 ui.info((proc.stdout + "\n" + proc.stderr).strip())
         elif choice == "2":
             port = input("  Основной порт: ").strip()
             if port:
                 addr = port if ":" in port else f"127.0.0.1:{port}"
                 proc = subprocess.run(["adb", "connect", addr], capture_output=True, text=True, timeout=15)
+                phone.invalidate_adb_cache()
                 ui.info((proc.stdout + "\n" + proc.stderr).strip())
         elif choice == "3":
             subprocess.run(["adb", "kill-server"], capture_output=True, text=True, timeout=10)
             subprocess.run(["adb", "start-server"], capture_output=True, text=True, timeout=10)
+            phone.invalidate_adb_cache()
             ui.success("Сервер ADB перезапущен.")
     except (EOFError, KeyboardInterrupt):
         print()
@@ -4091,10 +4602,10 @@ def interactive_add_provider(agent: PhoneAgent) -> None:
     ui = agent.ui
     ui.info("Добавление API-провайдера или CLI-подписки (пустая строка — отмена):")
     try:
-        name = re.sub(r"[^a-z0-9_-]", "", input("  1. Короткое имя (напр. depp, nvidia, mycli): ").strip().lower())
+        name = re.sub(r"[^a-z0-9_-]", "", input("  1. Короткое имя (напр. dp, nvidia, mycli): ").strip().lower())
         if not name:
             return
-        ptype = input("  2. Протокол [openai / gemini / anthropic / cli] (по умолчанию openai): ").strip().lower() or "openai"
+        ptype = input("  2. Протокол [openai / gemini / anthropic / cli] (по умолч. openai): ").strip().lower() or "openai"
         if ptype not in ("openai", "gemini", "anthropic", "cli"):
             ui.warn("Поддерживаются только openai, gemini, anthropic, cli.")
             return
@@ -4112,7 +4623,7 @@ def interactive_add_provider(agent: PhoneAgent) -> None:
                 model=model,
                 api_key="",
                 requires_key=False,
-                supports_vision=True,
+                supports_vision=False,
                 description=f"CLI-подписка ({cli_cmd})",
             )
             agent.store.providers[name] = cfg
@@ -4164,44 +4675,35 @@ def handle_slash_command(line: str, agent: PhoneAgent) -> bool:
         return False
 
     if cmd == "/help":
-        ui.panel(
-            f"Команды GemPhone {APP_VERSION}",
-            "/bridge [режим] — нативный Accessibility Bridge: auto | bridge | adb | token <tok> | url <url>\n"
-            "/login [имя]    — войти по подписке (gemini-sub, claude-sub, chatgpt-sub)\n"
-            "/providers (/p) — список ИИ-провайдеров, подписок и ключей\n"
-            "/use <имя>      — переключить нейросеть или подписку\n"
-            "/quality [тип]  — чёткость скриншотов: eco | normal | hd\n"
-            "/notify [режим] — сигналы завершения: on | off | tts | test\n"
-            "/mode [тип]     — профиль инструментов: all | phone | code | chat\n"
-            "/steps [число]  — лимит шагов агента на один запрос\n"
-            "/budget [число] — лимит токенов на один запрос (0 — без лимита)\n"
-            "/status         — диагностика (Bridge, ADB, Termux:API, подписки, модель)\n"
-            "/adb            — мастер подключения беспроводной отладки ADB\n"
-            "/screen         — тест: показать элементы текущего экрана\n"
-            "/key [имя]      — задать API-ключ (или 'gcloud' для OAuth)\n"
-            "/add            — добавить свой API или CLI-подписку\n"
-            "/model [имя]    — сменить и сохранить модель\n"
-            "/vision         — вкл/выкл отправку скриншотов\n"
-            "/auto           — вкл/выкл автоподтверждение действий\n"
-            "/memory         — долгосрочная память\n"
-            "/save / /load   — сохранить или загрузить диалог\n"
-            "/tokens         — общий расход токенов за сессию\n"
-            "/clear          — очистить историю диалога\n"
-            "/exit           — выход",
-            style="cyan",
-        )
+        lines = [f"{c:<12} — {d}" for c, d in SLASH_COMMANDS_META]
+        ui.panel(f"Команды GemPhone {APP_VERSION}", "\n".join(lines))
+        return True
+
+    if cmd == "/bridge":
+        handle_bridge_command(agent, arg)
         return True
 
     if cmd == "/login":
         interactive_subscription_login(agent, arg)
         return True
 
+    if cmd == "/steps":
+        if not arg:
+            ui.info(f"Максимум шагов на запрос: {agent.max_steps}.")
+        else:
+            try:
+                agent.max_steps = max(1, int(arg))
+                ui.success(f"Новый лимит шагов: {agent.max_steps}.")
+            except ValueError:
+                ui.warn("Укажите целое число, например: /steps 30")
+        return True
+
     if cmd == "/quality":
         phone = agent.toolkit.phone
         sub = arg.lower()
         if not sub:
-            ui.info(f"Текущее качество скриншотов: {phone.screenshot_max_dim}px, JPEG {phone.screenshot_quality}%.")
-            ui.dim("Пресеты: /quality eco (720px, q=65) | /quality normal (1280px, q=85) | /quality hd (1920px, q=92)")
+            ui.info(f"Качество скриншотов: {phone.screenshot_max_dim}px, JPEG {phone.screenshot_quality}%.")
+            ui.dim("Пресеты: /quality eco | /quality normal | /quality hd")
         elif sub == "eco":
             phone.screenshot_max_dim, phone.screenshot_quality = 720, 65
             ui.success("Качество скриншотов: ECO (720px, JPEG 65%).")
@@ -4225,11 +4727,11 @@ def handle_slash_command(line: str, agent: PhoneAgent) -> bool:
             ui.dim("Использование: /notify on | /notify off | /notify tts | /notify test")
         elif sub in ("on", "вкл", "1"):
             n.enabled = True
-            ui.success("Оповещения о завершении ВКЛЮЧЕНЫ.")
+            ui.success("Оповещения ВКЛЮЧЕНЫ.")
         elif sub in ("off", "выкл", "0"):
             n.enabled = False
             n.clear()
-            ui.info("Оповещения Android ВЫКЛЮЧЕНЫ.")
+            ui.info("Оповещения ВЫКЛЮЧЕНЫ.")
         elif sub == "tts":
             n.tts = not n.tts
             ui.info(f"Голосовое «Готово» (TTS): {'ВКЛ' if n.tts else 'ВЫКЛ'}")
@@ -4243,7 +4745,7 @@ def handle_slash_command(line: str, agent: PhoneAgent) -> bool:
     if cmd == "/mode":
         valid: tuple[ToolMode, ...] = ("all", "phone", "code", "chat")
         if not arg:
-            ui.info(f"Текущий режим: {agent.toolkit.mode} ({len(agent.toolkit.tool_specs())} инстр.). Доступны: all, phone, code, chat.")
+            ui.info(f"Режим: {agent.toolkit.mode} ({len(agent.toolkit.tool_specs())} инстр.). Доступны: all, phone, code, chat.")
         elif arg.lower() in valid:
             agent.toolkit.mode = arg.lower()  # type: ignore[assignment]
             ui.success(f"Режим переключён на '{agent.toolkit.mode}' ({len(agent.toolkit.tool_specs())} инстр.).")
@@ -4263,65 +4765,19 @@ def handle_slash_command(line: str, agent: PhoneAgent) -> bool:
                 ui.warn("Укажите число, например: /budget 40000 или /budget 50k")
         return True
 
-    if cmd == "/steps":
-        if not arg:
-            ui.info(f"Лимит шагов на запрос: {agent.max_steps} (укажите: /steps 30)")
-        else:
-            try:
-                val = int(arg)
-                if val < 1 or val > 500:
-                    raise ValueError
-                agent.max_steps = val
-                ui.success(f"Новый лимит шагов: {agent.max_steps}")
-            except ValueError:
-                ui.warn("Укажите целое число от 1 до 500, например: /steps 30")
-        return True
-
-    if cmd == "/bridge":
-        phone = agent.toolkit.phone
-        sub_parts = arg.split(maxsplit=1) if arg else []
-        sub = sub_parts[0].lower() if sub_parts else ""
-        val = sub_parts[1].strip() if len(sub_parts) > 1 else ""
-        if not sub or sub == "status":
-            kind, label = phone.active_transport(force_refresh=True)
-            tok_state = mask_secret(phone.bridge.effective_token()) if phone.bridge.effective_token() else "не задан"
-            ui.info(f"Транспорт: {label} (режим: {phone.bridge_mode}) | URL: {phone.bridge.base_url} | Токен: {tok_state}")
-            ui.dim("Команды: /bridge auto | /bridge bridge | /bridge adb | /bridge token <токен> | /bridge url <http://...>")
-        elif sub in ("auto", "bridge", "adb"):
-            phone.bridge_mode = sub  # type: ignore[assignment]
-            kind, label = phone.active_transport(force_refresh=True)
-            ui.success(f"Режим транспорта: {sub} -> {label}")
-        elif sub == "token":
-            if not val:
-                ui.warn("Укажите токен из приложения GemPhone Bridge: /bridge token <ваш_токен>")
-            else:
-                phone.bridge.save_token(val)
-                _, label = phone.active_transport(force_refresh=True)
-                ui.success(f"Токен Bridge сохранён ({mask_secret(val)}). Статус: {label}")
-        elif sub == "url":
-            if not val.startswith(("http://127.0.0.1", "http://localhost")):
-                ui.warn("Из соображений безопасности разрешён только локальный адрес (http://127.0.0.1:PORT).")
-            else:
-                phone.bridge.base_url = val.rstrip("/")
-                _, label = phone.active_transport(force_refresh=True)
-                ui.success(f"URL Bridge: {phone.bridge.base_url} -> {label}")
-        else:
-            ui.warn("Использование: /bridge [auto|bridge|adb|token <токен>|url <url>]")
-        return True
-
     if cmd == "/status":
         print_status_report(agent)
         return True
 
     if cmd == "/adb":
         interactive_adb_wizard(agent)
-        agent.toolkit.phone.active_transport(force_refresh=True)
         return True
 
     if cmd == "/screen":
         try:
             dump = agent.toolkit.phone.dump_ui(only_interactive=True)
-            ui.panel(f"Экран ({dump['app']}, {dump['screen']})", dump["ui"] or "(пусто)", style="green")
+            via_lbl = dump.get("via", "auto")
+            ui.panel(f"Экран ({dump['app']}, {dump['screen']}, {via_lbl})", dump["ui"] or "(пусто)")
         except Exception as exc:
             ui.error(f"Ошибка: {exc}")
         return True
@@ -4338,7 +4794,7 @@ def handle_slash_command(line: str, agent: PhoneAgent) -> bool:
                 status_str = "OK" if cfg.effective_api_key() else "нет"
             rows.append(
                 [
-                    "*" if name == agent.client.provider_name else "",
+                    "●" if name == agent.client.provider_name else "",
                     name,
                     cfg.provider_type,
                     status_str,
@@ -4346,7 +4802,7 @@ def handle_slash_command(line: str, agent: PhoneAgent) -> bool:
                 ]
             )
         ui.table("ИИ-провайдеры и подписки", ["", "Имя", "Тип", "Доступ", "Модель"], rows)
-        ui.dim("Переключить: /use <имя>  |  Подписка: /login <имя>  |  Ключ: /key <имя>")
+        ui.dim("Переключить: /use <имя>  ·  Подписка: /login <имя>  ·  Ключ: /key <имя>")
         return True
 
     if cmd == "/add":
@@ -4391,7 +4847,7 @@ def handle_slash_command(line: str, agent: PhoneAgent) -> bool:
             agent.store.active_provider = target
             agent.store.save()
             agent.switch_client(create_llm_client(cfg, key), preserve_context=True)
-            ui.success(f"Активный провайдер: {target} | Модель: {cfg.model}")
+            ui.success(f"Активный провайдер: {target} · {cfg.model}")
         except (SystemExit, ValueError) as exc:
             ui.error(str(exc))
         return True
@@ -4457,7 +4913,7 @@ def handle_slash_command(line: str, agent: PhoneAgent) -> bool:
 
     if cmd == "/clear":
         agent.clear_history()
-        ui.success("История очищена (контекст сброшен до нуля).")
+        ui.success("История очищена.")
         return True
 
     ui.warn(f"Неизвестная команда: {cmd}. Введите /help.")
@@ -4465,18 +4921,17 @@ def handle_slash_command(line: str, agent: PhoneAgent) -> bool:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="gemphone", description="ИИ-агент управления Android (API + подписки OAuth).")
+    parser = argparse.ArgumentParser(prog="gemphone", description=f"GemPhone {APP_VERSION} — Android AI Agent.")
     parser.add_argument("-d", "--dir", type=Path, default=Path.cwd(), help="Рабочая директория.")
-    parser.add_argument("-P", "--provider", default=None, help="Провайдер или подписка (claude-sub, gemini-sub, chatgpt-sub).")
+    parser.add_argument("-P", "--provider", default=None, help="Провайдер или подписка.")
     parser.add_argument("-m", "--model", default=None, help="ID модели.")
     parser.add_argument("--mode", choices=("all", "phone", "code", "chat"), default="all", help="Набор инструментов.")
     parser.add_argument("--budget", type=int, default=DEFAULT_TURN_TOKEN_BUDGET, help="Лимит токенов на 1 запрос.")
     parser.add_argument("--api-key", default=None, help="API-ключ.")
+    parser.add_argument("--bridge-port", type=int, default=BRIDGE_DEFAULT_PORT, help="Порт локального Bridge.")
     parser.add_argument("--adb-serial", default=None, help="Serial устройства ADB.")
-    parser.add_argument("--bridge-url", default=None, help="URL локального GemPhone Bridge (по умолч. http://127.0.0.1:7331).")
-    parser.add_argument("--transport", choices=("auto", "bridge", "adb"), default="auto", help="Транспорт управления экраном.")
     parser.add_argument("-p", "--prompt", default=None, help="Одноразовый запрос.")
-    parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS, help="Максимум шагов (по умолч. 10).")
+    parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS, help="Максимум шагов.")
     parser.add_argument("--auto", action="store_true", help="Автоподтверждение действий.")
     parser.add_argument("--yolo", action="store_true", help="Полное автоподтверждение.")
     return parser
@@ -4513,7 +4968,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         ui.error(str(exc))
         return 1
 
-    phone = PhoneController(target_serial=args.adb_serial, bridge_url=args.bridge_url, bridge_mode=args.transport)
+    bridge = AccessibilityBridgeClient(host=BRIDGE_DEFAULT_HOST, port=max(1, int(args.bridge_port)))
+    phone = PhoneController(target_serial=args.adb_serial, bridge=bridge)
     notifier = PhoneNotifier(enabled=not non_interactive)
     policy = ApprovalPolicy(
         auto_approve_moderate=args.auto or args.yolo,
@@ -4552,52 +5008,62 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (KeyboardInterrupt, RequestCancelledError):
             return 130
 
-    _, transport_label = phone.active_transport(force_refresh=True)
-    api_state = "Termux:API: OK" if phone.has_termux_api() else "Termux:API: нет"
-    ui.panel(
-        f"✻ GemPhone {APP_VERSION} — Android AI Agent (Bridge + ADB + Subscriptions)",
-        f"API      : {client.provider_name} / {client.model} ({client.config.provider_type})\n"
-        f"Режим    : {toolkit.mode} ({len(toolkit.tool_specs())} инстр.) | Шаги: {agent.max_steps} (/steps) | Скрины: {phone.screenshot_max_dim}px\n"
-        f"Транспорт: {transport_label}  |  {api_state}  |  Отмена: ESC / шторка\n"
-        f"Команды  : /bridge  /login  /use  /mode  /steps  /budget  /status  /adb  /help",
-        style="cyan",
+    transport_state = phone.transport_badge(force=True)
+    ui.header_card(
+        provider=client.provider_name,
+        model=client.model,
+        workspace=str(workspace),
+        transport_state=transport_state,
+        mode=toolkit.mode,
+        tools_count=len(toolkit.tool_specs()),
     )
 
-    slash_commands = [
-        "/bridge", "/login", "/providers", "/use", "/quality", "/notify",
-        "/mode", "/steps", "/budget", "/status", "/adb", "/screen",
-        "/key", "/add", "/model", "/vision", "/auto", "/memory",
-        "/save", "/load", "/tokens", "/clear", "/help", "/exit",
-    ]
     prompt_session = None
-    if HAS_PROMPT_TOOLKIT and PromptSession is not None and FileHistory is not None:
+    pt_style = None
+    if HAS_PROMPT_TOOLKIT and PromptSession is not None and FileHistory is not None and PTStyle is not None:
         try:
             APP_DIR.mkdir(parents=True, exist_ok=True)
-            completer = WordCompleter(slash_commands, ignore_case=True, sentence=True) if WordCompleter else None
+            pt_style = PTStyle.from_dict(
+                {
+                    "prompt": f"bold {ACCENT}",
+                    "bottom-toolbar": "bg:#1c1c1c #9e9e9e",
+                    "completion-menu.completion": "bg:#222222 #e0e0e0",
+                    "completion-menu.completion.current": f"bg:{ACCENT} #111111 bold",
+                    "completion-menu.meta.completion": "bg:#1a1a1a #888888",
+                    "completion-menu.meta.completion.current": f"bg:{ACCENT} #111111",
+                }
+            )
             prompt_session = PromptSession(
                 history=FileHistory(str(HISTORY_PATH)),
-                completer=completer,
-                complete_while_typing=False,
+                completer=_SlashCompleter(),
+                complete_while_typing=True,
+                style=pt_style,
             )
         except Exception:
             prompt_session = None
 
-    def _toolbar() -> str:
-        # Только кэшированные значения в памяти — ноль subprocess/сетевых вызовов при вводе!
-        auto_lbl = "AUTO" if agent.toolkit.policy.auto_approve_moderate else "ASK"
-        return (
-            f" {agent.client.provider_name}/{agent.client.model} | "
-            f"{phone.cached_transport_label()} | "
-            f"{agent.toolkit.mode} | {auto_lbl} | "
-            f"ток: {format_tokens(agent.usage.total_tokens)} "
+    def _bottom_toolbar() -> Any:
+        if not HAS_PROMPT_TOOLKIT or HTML is None:
+            return ""
+        safe_model = html_escape(agent.client.model)
+        safe_mode = html_escape(agent.toolkit.mode)
+        safe_transport = html_escape(phone.transport_badge(force=False))
+        auto_lbl = " · AUTO" if policy.auto_approve_moderate else ""
+        return HTML(
+            f" <b>{safe_model}</b> | {safe_mode} | "
+            f"{format_tokens(agent.usage.total_tokens)} ток. | {safe_transport}{auto_lbl} | /help "
         )
 
     while True:
         try:
-            if prompt_session is not None:
-                user_input = prompt_session.prompt("\n❯ ", bottom_toolbar=_toolbar).strip()
+            ui.rule()
+            if prompt_session is not None and HTML is not None:
+                user_input = prompt_session.prompt(
+                    HTML("<prompt>❯ </prompt>"),
+                    bottom_toolbar=_bottom_toolbar,
+                ).strip()
             else:
-                user_input = input("\n❯ ").strip()
+                user_input = input("❯ ").strip()
         except EOFError:
             ui.info("\nДо встречи!")
             return 0
