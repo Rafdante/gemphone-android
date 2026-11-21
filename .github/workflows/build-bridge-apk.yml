@@ -52,8 +52,8 @@ jobs:
         working-directory: bridge
         run: |
           KEYSTORE=$RUNNER_TEMP/gemphone.keystore
-          if [ -f tools/gemphone.keystore ]; then
-            cp tools/gemphone.keystore "$KEYSTORE"
+          if [ -f "$GITHUB_WORKSPACE/tools/gemphone.keystore" ]; then
+            cp "$GITHUB_WORKSPACE/tools/gemphone.keystore" "$KEYSTORE"
           else
             keytool -genkeypair -v -keystore "$KEYSTORE" -alias gemphone \
               -keyalg RSA -keysize 2048 -validity 10000 \
