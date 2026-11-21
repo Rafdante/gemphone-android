@@ -22,3 +22,10 @@ venv/
 .idea/
 .vscode/
 .DS_Store
+
+# --- GemPhone Bridge (Gradle) и токен ---
+.gemphone/bridge.token
+bridge/.gradle/
+bridge/build/
+bridge/app/build/
+bridge/local.properties

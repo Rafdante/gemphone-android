@@ -67,11 +67,13 @@ except ImportError:
 
 try:
     from prompt_toolkit import PromptSession  # type: ignore[import-not-found]
+    from prompt_toolkit.completion import WordCompleter  # type: ignore[import-not-found]
     from prompt_toolkit.history import FileHistory  # type: ignore[import-not-found]
 
     HAS_PROMPT_TOOLKIT = True
 except ImportError:
     PromptSession = None  # type: ignore[assignment]
+    WordCompleter = None  # type: ignore[assignment]
     FileHistory = None  # type: ignore[assignment]
     HAS_PROMPT_TOOLKIT = False
 
@@ -123,8 +125,11 @@ MAX_READ_LINES: Final[int] = 150
 SCREENSHOT_MAX_DIM: Final[int] = 1280
 SCREENSHOT_HQ_MAX_DIM: Final[int] = 1920
 SCREENSHOT_JPEG_QUALITY: Final[int] = 85
-HTTP_USER_AGENT: Final[str] = "GemPhone/3.7 (Android; Termux)"
+APP_VERSION: Final[str] = "3.8.1"
+HTTP_USER_AGENT: Final[str] = f"GemPhone/{APP_VERSION} (Android; Termux)"
 CANCEL_FLAG_PATH: Final[Path] = APP_DIR / "cancel.flag"
+BRIDGE_TOKEN_PATH: Final[Path] = APP_DIR / "bridge.token"
+DEFAULT_BRIDGE_URL: Final[str] = "http://127.0.0.1:7331"
 
 RiskLevel = Literal["safe", "moderate", "dangerous"]
 ToolMode = Literal["all", "phone", "code", "chat"]
@@ -330,7 +335,7 @@ class _FallbackSpinner:
         self._message = message
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._active = sys.stderr.isatty()
+        self._active = bool(getattr(sys.stderr, "isatty", lambda: False)())
 
     def __enter__(self) -> _FallbackSpinner:
         if self._active:
@@ -362,16 +367,32 @@ class ConsoleUI:
 
     def __init__(self) -> None:
         self.rich_console = Console() if HAS_RICH else None
-        self.ansi = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+        self.ansi = bool(getattr(sys.stdout, "isatty", lambda: False)()) and os.environ.get("NO_COLOR") is None
 
     def width(self) -> int:
         cols = shutil.get_terminal_size(fallback=(60, 24)).columns
         return max(34, min(cols, 84))
 
+    @contextmanager
     def status(self, message: str) -> Any:
         if self.rich_console is not None:
-            return self.rich_console.status(f"[cyan]{rich_escape(message)}[/cyan]", spinner="dots")
-        return _FallbackSpinner(message)
+            started = time.perf_counter()
+            stop_ev = threading.Event()
+            with self.rich_console.status(f"[cyan]✻ {rich_escape(message)}[/cyan]", spinner="dots") as st:
+                def _tick() -> None:
+                    while not stop_ev.wait(0.5):
+                        elapsed = time.perf_counter() - started
+                        st.update(f"[cyan]✻ {rich_escape(message)}[/cyan] [dim]· {elapsed:.1f}s[/dim]")
+                t = threading.Thread(target=_tick, daemon=True)
+                t.start()
+                try:
+                    yield st
+                finally:
+                    stop_ev.set()
+                    t.join(timeout=0.2)
+            return
+        with _FallbackSpinner(message):
+            yield
 
     def info(self, text: str) -> None:
         if self.rich_console is not None:
@@ -460,12 +481,25 @@ class ConsoleUI:
         joined = ", ".join(items)
         if self.rich_console is not None:
             self.rich_console.print(
-                f"  [bold cyan]⚙ {rich_escape(name)}[/bold cyan][dim]({rich_escape(joined)})[/dim]"
+                f"[bold cyan]●[/bold cyan] [bold]{rich_escape(name)}[/bold][dim]({rich_escape(joined)})[/dim]"
             )
         elif self.ansi:
-            print(f"  \033[36m⚙ {name}\033[0m\033[2m({joined})\033[0m")
+            print(f"\033[36m●\033[0m \033[1m{name}\033[0m\033[2m({joined})\033[0m")
         else:
-            print(f"  * {name}({joined})")
+            print(f"* {name}({joined})")
+
+    def tool_result(self, summary: str, *, ok: bool = True) -> None:
+        clean = summary.replace("\n", " ").strip()
+        if len(clean) > 110:
+            clean = clean[:107] + "..."
+        if self.rich_console is not None:
+            color = "dim" if ok else "red"
+            self.rich_console.print(f"  [dim]⎿[/dim]  [{color}]{rich_escape(clean)}[/{color}]")
+        elif self.ansi:
+            code = "2" if ok else "31"
+            print(f"  \033[2m⎿\033[0m  \033[{code}m{clean}\033[0m")
+        else:
+            print(f"  |_ {clean}")
 
     def diff(self, old_text: str, new_text: str, filename: str) -> None:
         lines = list(
@@ -557,7 +591,7 @@ class CancellationMonitor:
         return self.event.is_set()
 
     def _enable_cbreak(self) -> None:
-        if HAS_TERMIOS and termios is not None and tty is not None and sys.stdin.isatty():
+        if HAS_TERMIOS and termios is not None and tty is not None and bool(getattr(sys.stdin, "isatty", lambda: False)()):
             try:
                 self._stdin_fd = sys.stdin.fileno()
                 if self._old_termios is None:
@@ -691,7 +725,7 @@ class PhoneNotifier:
         threading.Thread(target=_worker, daemon=True).start()
 
     def _terminal_bell(self) -> None:
-        if sys.stdout.isatty():
+        if bool(getattr(sys.stdout, "isatty", lambda: False)()):
             try:
                 sys.stdout.write("\a")
                 sys.stdout.flush()
@@ -2161,17 +2195,146 @@ class UiElement:
         return f"{self.element_id}:{flag_str}{lbl_str}{res_str} @{self.center_x},{self.center_y}"
 
 
+
+class AccessibilityBridgeClient:
+    """HTTP-клиент локального Android-компаньона GemPhone Bridge (AccessibilityService, 127.0.0.1:7331)."""
+
+    def __init__(self, base_url: str | None = None, token: str | None = None) -> None:
+        self.base_url = (base_url or os.environ.get("GEMPHONE_BRIDGE_URL") or DEFAULT_BRIDGE_URL).rstrip("/")
+        self._explicit_token = token
+
+    def effective_token(self) -> str:
+        if self._explicit_token is not None:
+            return self._explicit_token.strip()
+        env_tok = os.environ.get("GEMPHONE_BRIDGE_TOKEN", "").strip()
+        if env_tok:
+            return env_tok
+        if BRIDGE_TOKEN_PATH.exists():
+            try:
+                return BRIDGE_TOKEN_PATH.read_text(encoding="utf-8").strip()
+            except OSError:
+                return ""
+        return ""
+
+    def save_token(self, token: str) -> None:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        tok = token.strip()
+        self._explicit_token = tok
+        fd = os.open(BRIDGE_TOKEN_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(tok + "\n")
+        os.chmod(BRIDGE_TOKEN_PATH, 0o600)
+
+    def _headers(self, *, json_body: bool = False) -> dict[str, str]:
+        h: dict[str, str] = {"User-Agent": HTTP_USER_AGENT}
+        if json_body:
+            h["Content-Type"] = "application/json; charset=utf-8"
+        tok = self.effective_token()
+        if tok:
+            h["X-GemPhone-Token"] = tok
+        return h
+
+    def request_json(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout: float = 8.0,
+    ) -> dict[str, Any]:
+        url = f"{self.base_url}{path}"
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(url, data=data, headers=self._headers(json_body=data is not None), method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                return json.loads(raw) if raw.strip() else {}
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Bridge HTTP {exc.code}: {body[:200]}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError(f"Bridge недоступен ({self.base_url}): {exc}") from exc
+
+    def request_bytes(self, path: str, *, timeout: float = 12.0) -> bytes:
+        url = f"{self.base_url}{path}"
+        req = urllib.request.Request(url, headers=self._headers(), method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Bridge HTTP {exc.code}: {body[:200]}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError(f"Bridge недоступен ({self.base_url}): {exc}") from exc
+
+    def is_available(self, *, timeout: float = 0.6) -> bool:
+        try:
+            st = self.request_json("GET", "/status", timeout=timeout)
+            return bool(st.get("ok") and st.get("accessibility_enabled", True))
+        except Exception:
+            return False
+
+    def status(self, *, timeout: float = 1.5) -> dict[str, Any]:
+        return self.request_json("GET", "/status", timeout=timeout)
+
+
 class PhoneController:
     """Высокоуровневый драйвер Android для Termux (ADB + Termux:API)."""
 
     _BOUNDS_RE: Final[re.Pattern[str]] = re.compile(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]")
 
-    def __init__(self, target_serial: str | None = None) -> None:
+    def __init__(
+        self,
+        target_serial: str | None = None,
+        bridge_url: str | None = None,
+        bridge_mode: Literal["auto", "bridge", "adb"] = "auto",
+    ) -> None:
         self.target_serial = target_serial
+        self.bridge = AccessibilityBridgeClient(base_url=bridge_url)
+        self.bridge_mode: Literal["auto", "bridge", "adb"] = bridge_mode
         self.last_ui_elements: dict[int, UiElement] = {}
         self._screen_size_cache: tuple[int, int] | None = None
         self.screenshot_max_dim: int = SCREENSHOT_MAX_DIM
         self.screenshot_quality: int = SCREENSHOT_JPEG_QUALITY
+        self._transport_cache: tuple[float, str, str] | None = None
+        self._transport_ttl: float = 5.0
+
+    def invalidate_transport_cache(self) -> None:
+        self._transport_cache = None
+
+    def _probe_transport(self) -> tuple[str, str]:
+        if self.bridge_mode in ("auto", "bridge") and self.bridge.is_available():
+            return ("bridge", f"Bridge:{self.bridge.base_url.rsplit(':', 1)[-1]}")
+        if self.bridge_mode == "bridge":
+            return ("none", "Bridge: нет (/bridge)")
+        serial = self.active_adb_serial()
+        if serial:
+            return ("adb", f"ADB:{serial}")
+        return ("none", "Нет связи (/bridge или /adb)")
+
+    def active_transport(self, *, force_refresh: bool = False) -> tuple[str, str]:
+        now = time.monotonic()
+        if not force_refresh and self._transport_cache is not None:
+            ts, kind, label = self._transport_cache
+            if now - ts < self._transport_ttl:
+                return (kind, label)
+        kind, label = self._probe_transport()
+        self._transport_cache = (now, kind, label)
+        return (kind, label)
+
+    def cached_transport_label(self) -> str:
+        """Мгновенный статус для нижней панели ввода — НИКОГДА не вызывает subprocess/сеть."""
+        if self._transport_cache is not None:
+            return self._transport_cache[2]
+        return "Bridge/ADB: ?"
+
+    def _use_bridge(self) -> bool:
+        if self.bridge_mode == "adb":
+            return False
+        if self.bridge_mode == "bridge":
+            return True
+        kind, _ = self.active_transport()
+        return kind == "bridge"
 
     def has_adb(self) -> bool:
         return shutil.which("adb") is not None
@@ -2248,6 +2411,16 @@ class PhoneController:
     def get_screen_size(self) -> tuple[int, int]:
         if self._screen_size_cache is not None:
             return self._screen_size_cache
+        if self._use_bridge():
+            try:
+                st = self.bridge.status()
+                w, h = int(st.get("width", 0)), int(st.get("height", 0))
+                if w > 0 and h > 0:
+                    self._screen_size_cache = (w, h)
+                    return self._screen_size_cache
+            except Exception:
+                if self.bridge_mode == "bridge":
+                    raise
         proc = self.run_adb(["shell", "wm", "size"], timeout=8)
         match = re.search(r"(\d+)\s*x\s*(\d+)", proc.stdout)
         if match:
@@ -2256,6 +2429,15 @@ class PhoneController:
         return (1080, 2400)
 
     def get_foreground_app(self) -> str:
+        if self._use_bridge():
+            try:
+                st = self.bridge.status()
+                app = str(st.get("app", "")).strip()
+                if app:
+                    return app
+            except Exception:
+                if self.bridge_mode == "bridge":
+                    raise
         proc = self.run_adb(["shell", "dumpsys", "window"], timeout=10)
         for pattern in (
             r"mCurrentFocus=Window\{[^\}]+\s+([^\s\}]+)\}",
@@ -2266,7 +2448,55 @@ class PhoneController:
                 return m.group(1)
         return "unknown"
 
+    def _dump_ui_via_bridge(self, *, only_interactive: bool = False) -> dict[str, Any]:
+        qs = "?only_interactive=1" if only_interactive else ""
+        data = self.bridge.request_json("GET", f"/ui{qs}", timeout=8.0)
+        nodes = data.get("elements") or []
+        elements: list[UiElement] = []
+        for idx, n in enumerate(nodes[:60], start=1):
+            b = n.get("bounds") or [0, 0, 0, 0]
+            if len(b) != 4:
+                continue
+            x1, y1, x2, y2 = int(b[0]), int(b[1]), int(b[2]), int(b[3])
+            if x2 <= x1 or y2 <= y1:
+                continue
+            elements.append(
+                UiElement(
+                    element_id=idx,
+                    text=str(n.get("text") or "").strip(),
+                    content_desc=str(n.get("contentDesc") or "").strip(),
+                    resource_id=str(n.get("resourceId") or "").strip(),
+                    class_name=str(n.get("className") or "").strip(),
+                    center_x=(x1 + x2) // 2,
+                    center_y=(y1 + y2) // 2,
+                    bounds=(x1, y1, x2, y2),
+                    clickable=bool(n.get("clickable", False)),
+                    scrollable=bool(n.get("scrollable", False)),
+                    editable=bool(n.get("editable", False)),
+                    focused=bool(n.get("focused", False)),
+                )
+            )
+        self.last_ui_elements = {e.element_id: e for e in elements}
+        screen = str(data.get("screen") or "")
+        if not screen:
+            w, h = self.get_screen_size()
+            screen = f"{w}x{h}"
+        return {
+            "transport": "bridge",
+            "screen": screen,
+            "app": str(data.get("app") or "unknown"),
+            "legend": "id:[c=click,in=input,sc=scroll] \"text\" #res @x,y",
+            "ui": "\n".join(e.to_compact_line() for e in elements),
+        }
+
     def dump_ui(self, *, only_interactive: bool = False) -> dict[str, Any]:
+        if self._use_bridge():
+            try:
+                return self._dump_ui_via_bridge(only_interactive=only_interactive)
+            except Exception:
+                self.invalidate_transport_cache()
+                if self.bridge_mode == "bridge":
+                    raise
         remote_path = "/sdcard/gemphone_ui.xml"
         dump_proc = self.run_adb(["shell", "uiautomator", "dump", remote_path], timeout=20)
         if dump_proc.returncode != 0:
@@ -2348,10 +2578,22 @@ class PhoneController:
         quality: int | None = None,
         hq: bool = False,
     ) -> tuple[dict[str, Any], ImageAttachment]:
-        proc = self.run_adb(["exec-out", "screencap", "-p"], timeout=20, binary=True)
-        raw_png: bytes = proc.stdout
-        if proc.returncode != 0 or len(raw_png) < 100:
-            raise RuntimeError("Не удалось снять скриншот (FLAG_SECURE или обрыв ADB).")
+        raw_png: bytes = b""
+        used_transport = "adb"
+        if self._use_bridge():
+            try:
+                raw_png = self.bridge.request_bytes("/screenshot", timeout=12.0)
+                if len(raw_png) >= 100:
+                    used_transport = "bridge"
+            except Exception:
+                raw_png = b""
+                if self.bridge_mode == "bridge":
+                    raise
+        if len(raw_png) < 100:
+            proc = self.run_adb(["exec-out", "screencap", "-p"], timeout=20, binary=True)
+            raw_png = proc.stdout
+            if proc.returncode != 0 or len(raw_png) < 100:
+                raise RuntimeError("Не удалось снять скриншот (FLAG_SECURE или обрыв ADB/Bridge).")
 
         target_dim = SCREENSHOT_HQ_MAX_DIM if hq else (max_dim or self.screenshot_max_dim)
         target_qual = 92 if hq else (quality or self.screenshot_quality)
@@ -2389,6 +2631,7 @@ class PhoneController:
         b64 = base64.b64encode(out_bytes).decode("ascii")
         meta = {
             "ok": True,
+            "transport": used_transport,
             "app": self.get_foreground_app(),
             "dim": dimensions,
             "kb": round(len(out_bytes) / 1024, 1),
@@ -2416,15 +2659,22 @@ class PhoneController:
         if x is None or y is None:
             raise ValueError("Укажите element_id или x, y.")
 
+        dur = max(300, min(int(duration_ms), 4000)) if long_press else 60
+        action = f"long_press({dur}ms)" if long_press else "tap"
+        if self._use_bridge():
+            try:
+                self.bridge.request_json("POST", "/tap", {"x": int(x), "y": int(y), "duration_ms": dur})
+                return {"ok": True, "transport": "bridge", "action": action, "x": x, "y": y, "label": label or None}
+            except Exception:
+                self.invalidate_transport_cache()
+                if self.bridge_mode == "bridge":
+                    raise
         if long_press:
-            dur = max(300, min(int(duration_ms), 4000))
             self.run_adb(["shell", "input", "swipe", str(x), str(y), str(x), str(y), str(dur)])
-            action = f"long_press({dur}ms)"
         else:
             self.run_adb(["shell", "input", "tap", str(x), str(y)])
-            action = "tap"
 
-        return {"ok": True, "action": action, "x": x, "y": y, "label": label or None}
+        return {"ok": True, "transport": "adb", "action": action, "x": x, "y": y, "label": label or None}
 
     def swipe(
         self,
@@ -2454,10 +2704,31 @@ class PhoneController:
             raise ValueError("Укажите direction или x1, y1, x2, y2.")
 
         dur = max(50, min(int(duration_ms), 3000))
+        if self._use_bridge():
+            try:
+                self.bridge.request_json(
+                    "POST",
+                    "/swipe",
+                    {"x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2), "duration_ms": dur},
+                )
+                return {"ok": True, "transport": "bridge", "from": [x1, y1], "to": [x2, y2]}
+            except Exception:
+                self.invalidate_transport_cache()
+                if self.bridge_mode == "bridge":
+                    raise
         self.run_adb(["shell", "input", "swipe", str(x1), str(y1), str(x2), str(y2), str(dur)])
-        return {"ok": True, "from": [x1, y1], "to": [x2, y2]}
+        return {"ok": True, "transport": "adb", "from": [x1, y1], "to": [x2, y2]}
 
     def type_text(self, text: str, *, press_enter: bool = False) -> dict[str, Any]:
+        if self._use_bridge():
+            try:
+                res = self.bridge.request_json("POST", "/type", {"text": text, "press_enter": press_enter})
+                if res.get("ok"):
+                    return {"ok": True, "transport": "bridge", "method": "accessibility_set_text", "chars": len(text)}
+            except Exception:
+                self.invalidate_transport_cache()
+                if self.bridge_mode == "bridge":
+                    raise
         is_simple_ascii = bool(re.fullmatch(r"[A-Za-z0-9._:/@+-]+", text))
         method = "adb_input"
 
@@ -2480,9 +2751,18 @@ class PhoneController:
         return {"ok": True, "method": method, "chars": len(text)}
 
     def keyevent(self, key: str) -> dict[str, Any]:
-        keycode = ANDROID_KEYEVENTS.get(key.strip().upper(), key.strip().upper())
+        norm = key.strip().upper()
+        if self._use_bridge():
+            try:
+                res = self.bridge.request_json("POST", "/key", {"key": norm})
+                if res.get("ok"):
+                    return {"ok": True, "transport": "bridge", "keycode": norm}
+            except Exception:
+                if self.bridge_mode == "bridge":
+                    raise
+        keycode = ANDROID_KEYEVENTS.get(norm, norm)
         self.run_adb(["shell", "input", "keyevent", keycode])
-        return {"ok": True, "keycode": keycode}
+        return {"ok": True, "transport": "adb", "keycode": keycode}
 
     def app_control(
         self,
@@ -2496,6 +2776,12 @@ class PhoneController:
         if act == "current":
             return {"app": self.get_foreground_app()}
         if act == "list":
+            if self._use_bridge():
+                try:
+                    return self.bridge.request_json("POST", "/app", {"action": "list", "query": query})
+                except Exception:
+                    if self.bridge_mode == "bridge":
+                        raise
             proc = self.run_adb(["shell", "pm", "list", "packages", "-3"], timeout=12)
             pkgs = [ln.replace("package:", "").strip() for ln in proc.stdout.splitlines() if ln.startswith("package:")]
             if query:
@@ -2506,6 +2792,12 @@ class PhoneController:
         if act == "launch":
             if not package:
                 raise ValueError("Укажите package.")
+            if self._use_bridge():
+                try:
+                    return self.bridge.request_json("POST", "/app", {"action": "launch", "package": package})
+                except Exception:
+                    if self.bridge_mode == "bridge":
+                        raise
             proc = self.run_adb(["shell", "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1"], timeout=12)
             return {"ok": proc.returncode == 0, "package": package}
         if act == "stop":
@@ -2514,8 +2806,14 @@ class PhoneController:
             self.run_adb(["shell", "am", "force-stop", package], timeout=10)
             return {"ok": True, "stopped": package}
         if act == "open_url":
-            if not url:
-                raise ValueError("Укажите url.")
+            if not url or any(ch in url for ch in ("\n", "\r", "\x00")):
+                raise ValueError("Укажите корректный url.")
+            if self._use_bridge():
+                try:
+                    return self.bridge.request_json("POST", "/app", {"action": "open_url", "url": url})
+                except Exception:
+                    if self.bridge_mode == "bridge":
+                        raise
             self.run_adb(["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", url])
             return {"ok": True, "url": url}
         raise ValueError("action: current, list, launch, stop, open_url.")
@@ -2568,13 +2866,16 @@ CODE_TOOLS: Final[frozenset[str]] = frozenset(
 
 
 try:
-    from safety import detect_destructive_command  # общая политика с gemcode
+    from safety import check_fetch_url, detect_destructive_command  # общая политика с gemcode
     HAS_SAFETY = True
 except Exception:  # pragma: no cover — автономный запуск без пакета
     HAS_SAFETY = False
 
     def detect_destructive_command(command: str) -> str | None:
         return None
+
+    def check_fetch_url(url: str) -> str | None:
+        return None if url.startswith(("http://", "https://")) else "разрешены только http(s)"
 
 
 class AgentToolkit:
@@ -2976,10 +3277,22 @@ class AgentToolkit:
     # --- ADB-инструменты ---
 
     def _tool_adb_status(self, _args: dict[str, Any]) -> ToolExecutionResult:
-        if not self.phone.has_adb():
-            return ToolExecutionResult({"installed": False})
-        active = self.phone.active_adb_serial()
-        info: dict[str, Any] = {"installed": True, "connected": active is not None, "device": active}
+        kind, label = self.phone.active_transport(force_refresh=True)
+        info: dict[str, Any] = {
+            "transport": kind,
+            "label": label,
+            "bridge_available": kind == "bridge",
+            "adb_installed": self.phone.has_adb(),
+        }
+        if kind == "bridge":
+            info["connected"] = True
+            w, h = self.phone.get_screen_size()
+            info["screen"] = f"{w}x{h}"
+            info["app"] = self.phone.get_foreground_app()
+            return ToolExecutionResult(info)
+        active = self.phone.active_adb_serial() if self.phone.has_adb() else None
+        info["connected"] = active is not None
+        info["device"] = active
         if active:
             w, h = self.phone.get_screen_size()
             info["screen"] = f"{w}x{h}"
@@ -3049,7 +3362,8 @@ class AgentToolkit:
         query = str(args.get("query", "")).strip()
         url = str(args.get("url", "")).strip()
         if action in ("launch", "stop", "open_url"):
-            ok, reason = self._confirm(f"ADB {action}: {package or url}", risk="moderate")
+            risk: RiskLevel = "dangerous" if action == "open_url" else "moderate"
+            ok, reason = self._confirm(f"Android {action}: {package or url}", risk=risk)
             if not ok:
                 return ToolExecutionResult({"rejected": reason})
         return ToolExecutionResult(self.phone.app_control(action, package=package, query=query, url=url))
@@ -3329,8 +3643,12 @@ class AgentToolkit:
         return ToolExecutionResult({"ok": True, "path": rel_lbl})
 
     def _tool_write_file(self, args: dict[str, Any]) -> ToolExecutionResult:
-        rel, content = str(args.get("path", "")), str(args.get("content", ""))
+        rel, content = str(args.get("path", "")).strip(), str(args.get("content", ""))
+        if not rel or rel in (".", "./"):
+            return ToolExecutionResult({"error": "Укажите непустой путь к файлу."})
         target = self._resolve_safe_path(rel)
+        if target.exists() and target.is_dir():
+            return ToolExecutionResult({"error": f"'{rel}' — это директория, а не файл."})
         rel_lbl = self._rel(target)
         old_content = target.read_text(encoding="utf-8", errors="replace") if target.exists() and target.is_file() else ""
         self.ui.info(f"\nФайл: {rel_lbl}")
@@ -3369,8 +3687,9 @@ class AgentToolkit:
 
     def _tool_web_fetch(self, args: dict[str, Any]) -> ToolExecutionResult:
         url = str(args.get("url", "")).strip()
-        if not url.startswith(("http://", "https://")):
-            return ToolExecutionResult({"error": "Нужен http:// или https://"})
+        blocked_reason = check_fetch_url(url)
+        if blocked_reason:
+            return ToolExecutionResult({"error": f"URL отклонён: {blocked_reason}"})
         status, ctype, body = _http_get_text(url)
         if "html" in ctype.lower():
             parser = _HtmlTextExtractor()
@@ -3532,11 +3851,30 @@ class PhoneAgent:
                         self.ui.dim(turn.text)
 
                     results: list[tuple[ToolCall, ToolExecutionResult]] = []
+                    _SPIN_TOOLS = frozenset({"adb_status", "adb_ui_dump", "adb_screenshot", "web_fetch", "search_text"})
                     for call in turn.tool_calls:
                         _check_cancel()
                         self.ui.tool_badge(call.name, call.args)
-                        res = self.toolkit.execute(call.name, call.args)
+                        if call.name in _SPIN_TOOLS:
+                            with self.ui.status(f"Выполняю {call.name}..."):
+                                res = self.toolkit.execute(call.name, call.args)
+                        else:
+                            res = self.toolkit.execute(call.name, call.args)
                         _check_cancel()
+                        payload = res.payload
+                        if isinstance(payload, dict):
+                            if "error" in payload:
+                                self.ui.tool_result(f"ошибка: {payload['error']}", ok=False)
+                            elif "rejected" in payload:
+                                self.ui.tool_result(f"отклонено: {payload['rejected']}", ok=False)
+                            elif "ui" in payload:
+                                lines_n = len([ln for ln in str(payload["ui"]).splitlines() if ln.strip()])
+                                self.ui.tool_result(f"{payload.get('app', '')} · {lines_n} элем. ({payload.get('transport', 'adb')})")
+                            elif "dim" in payload and "kb" in payload:
+                                self.ui.tool_result(f"скриншот {payload['dim']} · {payload['kb']} KB ({payload.get('transport', 'adb')})")
+                            else:
+                                compact = ", ".join(f"{k}={v}" for k, v in list(payload.items())[:4])
+                                self.ui.tool_result(compact or "ok")
                         results.append((call, res))
 
                     self.client.add_tool_results(results)
@@ -3673,6 +4011,7 @@ def interactive_subscription_login(agent: PhoneAgent, target_name: str = "") -> 
 
 def print_status_report(agent: PhoneAgent) -> None:
     phone = agent.toolkit.phone
+    transport_kind, transport_label = phone.active_transport(force_refresh=True)
     active_adb = phone.active_adb_serial()
     n = agent.notifier
     notify_state = (
@@ -3693,7 +4032,8 @@ def print_status_report(agent: PhoneAgent) -> None:
         ["Режим инструментов", f"{agent.toolkit.mode} ({len(agent.toolkit.tool_specs())} шт.)"],
         ["Бюджет / Шаги", f"{format_tokens(agent.turn_token_budget)} ток. на запрос / макс {agent.max_steps} шагов"],
         ["Оповещения (/notify)", notify_state],
-        ["ADB (экран/тапы)", f"Подключён: {active_adb}" if active_adb else ("Установлен, нет устройств (/adb)" if phone.has_adb() else "НЕ установлен")],
+        ["Транспорт экрана", f"{transport_label} (режим: {phone.bridge_mode}, /bridge)"],
+        ["ADB (резерв)", f"Подключён: {active_adb}" if active_adb else ("Установлен, нет устройств (/adb)" if phone.has_adb() else "НЕ установлен")],
         ["Termux:API", "Доступен" if phone.has_termux_api() else "НЕ найден"],
         ["Библиотеки", f"rich={'OK' if HAS_RICH else '-'}, httpx={'OK' if HAS_HTTPX else '-'}, PIL={'OK' if HAS_PIL else '-'}, ptk={'OK' if HAS_PROMPT_TOOLKIT else '-'}"],
         ["Память фактов", f"{len(agent.memory.data)} записей"],
@@ -3825,15 +4165,17 @@ def handle_slash_command(line: str, agent: PhoneAgent) -> bool:
 
     if cmd == "/help":
         ui.panel(
-            "Команды GemPhone 3.7",
+            f"Команды GemPhone {APP_VERSION}",
+            "/bridge [режим] — нативный Accessibility Bridge: auto | bridge | adb | token <tok> | url <url>\n"
             "/login [имя]    — войти по подписке (gemini-sub, claude-sub, chatgpt-sub)\n"
             "/providers (/p) — список ИИ-провайдеров, подписок и ключей\n"
             "/use <имя>      — переключить нейросеть или подписку\n"
             "/quality [тип]  — чёткость скриншотов: eco | normal | hd\n"
             "/notify [режим] — сигналы завершения: on | off | tts | test\n"
             "/mode [тип]     — профиль инструментов: all | phone | code | chat\n"
+            "/steps [число]  — лимит шагов агента на один запрос\n"
             "/budget [число] — лимит токенов на один запрос (0 — без лимита)\n"
-            "/status         — диагностика (ADB, Termux:API, подписки, модель)\n"
+            "/status         — диагностика (Bridge, ADB, Termux:API, подписки, модель)\n"
             "/adb            — мастер подключения беспроводной отладки ADB\n"
             "/screen         — тест: показать элементы текущего экрана\n"
             "/key [имя]      — задать API-ключ (или 'gcloud' для OAuth)\n"
@@ -3921,12 +4263,59 @@ def handle_slash_command(line: str, agent: PhoneAgent) -> bool:
                 ui.warn("Укажите число, например: /budget 40000 или /budget 50k")
         return True
 
+    if cmd == "/steps":
+        if not arg:
+            ui.info(f"Лимит шагов на запрос: {agent.max_steps} (укажите: /steps 30)")
+        else:
+            try:
+                val = int(arg)
+                if val < 1 or val > 500:
+                    raise ValueError
+                agent.max_steps = val
+                ui.success(f"Новый лимит шагов: {agent.max_steps}")
+            except ValueError:
+                ui.warn("Укажите целое число от 1 до 500, например: /steps 30")
+        return True
+
+    if cmd == "/bridge":
+        phone = agent.toolkit.phone
+        sub_parts = arg.split(maxsplit=1) if arg else []
+        sub = sub_parts[0].lower() if sub_parts else ""
+        val = sub_parts[1].strip() if len(sub_parts) > 1 else ""
+        if not sub or sub == "status":
+            kind, label = phone.active_transport(force_refresh=True)
+            tok_state = mask_secret(phone.bridge.effective_token()) if phone.bridge.effective_token() else "не задан"
+            ui.info(f"Транспорт: {label} (режим: {phone.bridge_mode}) | URL: {phone.bridge.base_url} | Токен: {tok_state}")
+            ui.dim("Команды: /bridge auto | /bridge bridge | /bridge adb | /bridge token <токен> | /bridge url <http://...>")
+        elif sub in ("auto", "bridge", "adb"):
+            phone.bridge_mode = sub  # type: ignore[assignment]
+            kind, label = phone.active_transport(force_refresh=True)
+            ui.success(f"Режим транспорта: {sub} -> {label}")
+        elif sub == "token":
+            if not val:
+                ui.warn("Укажите токен из приложения GemPhone Bridge: /bridge token <ваш_токен>")
+            else:
+                phone.bridge.save_token(val)
+                _, label = phone.active_transport(force_refresh=True)
+                ui.success(f"Токен Bridge сохранён ({mask_secret(val)}). Статус: {label}")
+        elif sub == "url":
+            if not val.startswith(("http://127.0.0.1", "http://localhost")):
+                ui.warn("Из соображений безопасности разрешён только локальный адрес (http://127.0.0.1:PORT).")
+            else:
+                phone.bridge.base_url = val.rstrip("/")
+                _, label = phone.active_transport(force_refresh=True)
+                ui.success(f"URL Bridge: {phone.bridge.base_url} -> {label}")
+        else:
+            ui.warn("Использование: /bridge [auto|bridge|adb|token <токен>|url <url>]")
+        return True
+
     if cmd == "/status":
         print_status_report(agent)
         return True
 
     if cmd == "/adb":
         interactive_adb_wizard(agent)
+        agent.toolkit.phone.active_transport(force_refresh=True)
         return True
 
     if cmd == "/screen":
@@ -4084,6 +4473,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--budget", type=int, default=DEFAULT_TURN_TOKEN_BUDGET, help="Лимит токенов на 1 запрос.")
     parser.add_argument("--api-key", default=None, help="API-ключ.")
     parser.add_argument("--adb-serial", default=None, help="Serial устройства ADB.")
+    parser.add_argument("--bridge-url", default=None, help="URL локального GemPhone Bridge (по умолч. http://127.0.0.1:7331).")
+    parser.add_argument("--transport", choices=("auto", "bridge", "adb"), default="auto", help="Транспорт управления экраном.")
     parser.add_argument("-p", "--prompt", default=None, help="Одноразовый запрос.")
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS, help="Максимум шагов (по умолч. 10).")
     parser.add_argument("--auto", action="store_true", help="Автоподтверждение действий.")
@@ -4122,7 +4513,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ui.error(str(exc))
         return 1
 
-    phone = PhoneController(target_serial=args.adb_serial)
+    phone = PhoneController(target_serial=args.adb_serial, bridge_url=args.bridge_url, bridge_mode=args.transport)
     notifier = PhoneNotifier(enabled=not non_interactive)
     policy = ApprovalPolicy(
         auto_approve_moderate=args.auto or args.yolo,
@@ -4161,28 +4552,52 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (KeyboardInterrupt, RequestCancelledError):
             return 130
 
-    adb_state = f"ADB: {phone.active_adb_serial()}" if phone.active_adb_serial() else "ADB: нет (/adb)"
+    _, transport_label = phone.active_transport(force_refresh=True)
     api_state = "Termux:API: OK" if phone.has_termux_api() else "Termux:API: нет"
     ui.panel(
-        "GemPhone 3.7 — Android AI Agent (API + Subscriptions + Guard)",
-        f"API    : {client.provider_name} / {client.model} ({client.config.provider_type})\n"
-        f"Режим  : {toolkit.mode} ({len(toolkit.tool_specs())} инстр.) | Скрины: {phone.screenshot_max_dim}px (/quality)\n"
-        f"Модули : {adb_state}  |  {api_state}  |  Отмена: ESC или кнопка в шторке\n"
-        f"Команды: /login  /providers  /use  /mode  /budget  /status  /adb  /help  /exit",
+        f"✻ GemPhone {APP_VERSION} — Android AI Agent (Bridge + ADB + Subscriptions)",
+        f"API      : {client.provider_name} / {client.model} ({client.config.provider_type})\n"
+        f"Режим    : {toolkit.mode} ({len(toolkit.tool_specs())} инстр.) | Шаги: {agent.max_steps} (/steps) | Скрины: {phone.screenshot_max_dim}px\n"
+        f"Транспорт: {transport_label}  |  {api_state}  |  Отмена: ESC / шторка\n"
+        f"Команды  : /bridge  /login  /use  /mode  /steps  /budget  /status  /adb  /help",
         style="cyan",
     )
 
+    slash_commands = [
+        "/bridge", "/login", "/providers", "/use", "/quality", "/notify",
+        "/mode", "/steps", "/budget", "/status", "/adb", "/screen",
+        "/key", "/add", "/model", "/vision", "/auto", "/memory",
+        "/save", "/load", "/tokens", "/clear", "/help", "/exit",
+    ]
     prompt_session = None
     if HAS_PROMPT_TOOLKIT and PromptSession is not None and FileHistory is not None:
         try:
             APP_DIR.mkdir(parents=True, exist_ok=True)
-            prompt_session = PromptSession(history=FileHistory(str(HISTORY_PATH)))
+            completer = WordCompleter(slash_commands, ignore_case=True, sentence=True) if WordCompleter else None
+            prompt_session = PromptSession(
+                history=FileHistory(str(HISTORY_PATH)),
+                completer=completer,
+                complete_while_typing=False,
+            )
         except Exception:
             prompt_session = None
 
+    def _toolbar() -> str:
+        # Только кэшированные значения в памяти — ноль subprocess/сетевых вызовов при вводе!
+        auto_lbl = "AUTO" if agent.toolkit.policy.auto_approve_moderate else "ASK"
+        return (
+            f" {agent.client.provider_name}/{agent.client.model} | "
+            f"{phone.cached_transport_label()} | "
+            f"{agent.toolkit.mode} | {auto_lbl} | "
+            f"ток: {format_tokens(agent.usage.total_tokens)} "
+        )
+
     while True:
         try:
-            user_input = (prompt_session.prompt("\nВы > ") if prompt_session else input("\nВы > ")).strip()
+            if prompt_session is not None:
+                user_input = prompt_session.prompt("\n❯ ", bottom_toolbar=_toolbar).strip()
+            else:
+                user_input = input("\n❯ ").strip()
         except EOFError:
             ui.info("\nДо встречи!")
             return 0
