@@ -30,7 +30,15 @@ jobs:
           echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
           chmod +x gradlew 2>/dev/null || true
           gradle --no-daemon wrapper --gradle-version 8.9
-          ./gradlew --no-daemon assembleDebug --stacktrace
+          set +e
+          ./gradlew --no-daemon assembleDebug --stacktrace 2>&1 | tee /tmp/build.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            grep -E "^e: |error:|FAILURE|Execution failed|Caused by|Could not|Unresolved" /tmp/build.log | tail -20 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+          fi
+          exit "$rc"
 
       - name: Show errors
         if: failure()
