@@ -261,19 +261,20 @@ class LocalHttpServer(
                                     result.put("ok", true).put("requested", true)
                                 }
                                 "create" -> {
-                                    if (!ShellRunner.init()) {
+                                    val granted = ShellRunner.init()
+                                    result.put("granted", granted)
+                                    if (!granted) {
                                         ShellRunner.requestPermission()
                                         result.put("ok", false)
                                             .put("need_permission", true)
-                                            .put("hint", "Разреши GemPhone Bridge в приложении Shizuku (или перезапусти запрос)")
-                                        writeJson(output, 200, result, keepAlive)
-                                        return@with
+                                            .put("hint", "Разреши GemPhone Bridge в приложении Shizuku, затем вызови create снова")
+                                    } else {
+                                        val w = body.optInt("width", 1080)
+                                        val h = body.optInt("height", 2344)
+                                        val dpi = body.optInt("dpi", 420)
+                                        val id = GemVirtualDisplay.create(service, w, h, dpi)
+                                        result.put("ok", id >= 0).put("display_id", id)
                                     }
-                                    val w = body.optInt("width", 1080)
-                                    val h = body.optInt("height", 2344)
-                                    val dpi = body.optInt("dpi", 420)
-                                    val id = GemVirtualDisplay.create(service, w, h, dpi)
-                                    result.put("ok", id >= 0).put("display_id", id)
                                 }
                                 "stop" -> {
                                     GemVirtualDisplay.stop()
