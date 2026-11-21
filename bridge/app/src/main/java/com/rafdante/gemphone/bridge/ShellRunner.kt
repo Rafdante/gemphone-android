@@ -12,16 +12,36 @@ object ShellRunner {
 
     fun init(): Boolean {
         return try {
-            // Shizuku 13.x: после запуска сервера доступен через Shizuku.newProcess
             val cls = Class.forName("rikka.shizuku.Shizuku")
             val binder = cls.getMethod("getBinder").invoke(null)
-            shizukuAvailable = binder != null
+            shizukuAvailable = binder != null && checkSelfPermission()
             shizukuAvailable
         } catch (e: Throwable) {
             shizukuAvailable = false
             false
         } finally {
             android.util.Log.i("ShellRunner", "shizukuAvailable=$shizukuAvailable sdk=${Build.VERSION.SDK_INT}")
+        }
+    }
+
+    /** Есть ли уже разрешение Shizuku. */
+    fun checkSelfPermission(): Boolean = try {
+        val cls = Class.forName("rikka.shizuku.Shizuku")
+        (cls.getMethod("checkSelfPermission").invoke(null) as Int) == 0
+    } catch (e: Throwable) {
+        false
+    }
+
+    /** Запросить разрешение — покажет диалог/уведомление Shizuku. */
+    fun requestPermission() {
+        try {
+            val cls = Class.forName("rikka.shizuku.Shizuku")
+            val argCls = Class.forName("rikka.shizuku.RequestPermissionResultListener")
+            // Простой путь: Shizuku.requestPermission(code)
+            cls.methods.firstOrNull { it.name == "requestPermission" && it.parameterTypes.size == 1 }
+                ?.invoke(null, 7331)
+        } catch (e: Throwable) {
+            android.util.Log.w("ShellRunner", "requestPermission: ${e.message}")
         }
     }
 

@@ -31,8 +31,8 @@ object GemVirtualDisplay {
         if (vd != null) return displayId
         val dm = ctx.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
         try {
-            val flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
+            // PRIVATE-дисплей разрешён любому приложению без permissions
+            val flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
             vd = dm.createVirtualDisplay(
                 "gemphone-agent-vd",
                 width,
@@ -75,9 +75,8 @@ object GemVirtualDisplay {
     /** Запуск приложения на виртуальном дисплее (нужен Shizuku/ADB). */
     fun launchOnDisplay(ctx: Context, packageName: String, id: Int = displayId): Boolean {
         return try {
-            val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
-            val cmd = "am start --display $id -n $(resolveLauncher(ctx, packageName))"
-            ShellRunner.exec(cmd)
+            val comp = resolveLauncher(ctx, packageName)
+            ShellRunner.exec("am start --display $id -n $comp")
         } catch (e: Exception) {
             false
         }

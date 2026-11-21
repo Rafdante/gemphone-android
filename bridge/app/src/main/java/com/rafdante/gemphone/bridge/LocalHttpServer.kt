@@ -256,7 +256,19 @@ class LocalHttpServer(
                             val action = body.optString("action", "status")
                             val result = JSONObject()
                             when (action) {
+                                "request" -> {
+                                    ShellRunner.requestPermission()
+                                    result.put("ok", true).put("requested", true)
+                                }
                                 "create" -> {
+                                    if (!ShellRunner.init()) {
+                                        ShellRunner.requestPermission()
+                                        result.put("ok", false)
+                                            .put("need_permission", true)
+                                            .put("hint", "Разреши GemPhone Bridge в приложении Shizuku (или перезапусти запрос)")
+                                        writeJson(output, 200, result, keepAlive)
+                                        return@with
+                                    }
                                     val w = body.optInt("width", 1080)
                                     val h = body.optInt("height", 2344)
                                     val dpi = body.optInt("dpi", 420)
@@ -292,6 +304,7 @@ class LocalHttpServer(
                                     .put("display_id", GemVirtualDisplay.currentDisplayId())
                             }
                             result.put("shizuku", ShellRunner.isShizuku())
+                            result.put("granted", ShellRunner.checkSelfPermission())
                             result.put("running", GemVirtualDisplay.isRunning())
                             writeJson(output, 200, result, keepAlive)
                         }

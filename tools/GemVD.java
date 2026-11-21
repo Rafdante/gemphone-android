@@ -43,7 +43,7 @@ public class GemVD {
             // packageName контекста должен совпадать с уже установленным пакетом.
             // пакет должен быть от uid, который запускает процесс.
             // Варианты: shell-процесс без пакета, либо реальный uid приложения.
-            String pkg = args.length > 5 ? args[5] : null;
+            String pkg = args.length > 5 ? args[5] : "com.android.shell";
             if (pkg == null) {
                 try {
                     Method getUid = ctxImpl.getMethod("getPackageName");
