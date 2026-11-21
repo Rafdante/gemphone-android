@@ -219,12 +219,11 @@ class GemAccessibilityService : AccessibilityService() {
             for (win in allWindows) {
                 val root = win.root ?: continue
                 toRecycle.add(root)
-                val focused = win.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-                if (focused != null) {
+                findFocusedInput(root)?.let { focused ->
                     toRecycle.add(focused)
-                    if (focused.isEditable) {
-                        candidates.add(Triple(focused, true, activeWindowId != null && focused.windowId == activeWindowId))
-                    }
+                    candidates.add(
+                        Triple(focused, true, activeWindowId != null && focused.windowId == activeWindowId)
+                    )
                 }
                 collectEditables(root, candidates, toRecycle, activeWindowId, 0)
             }
@@ -267,6 +266,21 @@ class GemAccessibilityService : AccessibilityService() {
         } finally {
             for (node in toRecycle) safeRecycle(node)
         }
+    }
+
+    /** Обход дерева в поисках узла с focus input (AccessibilityWindowInfo.findFocus недоступен). */
+    private fun findFocusedInput(root: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+        if (root == null) return null
+        if (root.isFocused && (root.isEditable || root.inputType != 0)) return root
+        for (i in 0 until root.childCount) {
+            val child = root.getChild(i) ?: continue
+            val hit = findFocusedInput(child)
+            if (hit == null) continue
+            if (hit === child) return child
+            safeRecycle(child)
+            return hit
+        }
+        return null
     }
 
     private fun supportsSetText(node: AccessibilityNodeInfo): Boolean {
