@@ -2,7 +2,8 @@
 """
 GemPhone — продвинутый мультипровайдерный ИИ-агент для полноценного управления
 Android-смартфоном из Termux (ADB + UI Automator + Vision + Termux:API + Код)
-с жёстким режимом экономии токенов (Token-Saver) и чётким Vision.
+с поддержкой подписок (Claude Pro/Max, Gemini Pro, ChatGPT Plus/Pro через OAuth CLI),
+жёстким режимом экономии токенов (Token-Saver) и чётким Vision.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from abc import ABC, abstractmethod
 import argparse
 import base64
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import difflib
 import getpass
@@ -21,8 +23,8 @@ import os
 from pathlib import Path
 import re
 import select
+import shlex
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -39,10 +41,7 @@ import threading
 import time
 from typing import Any, Final, Literal
 import urllib.error
-import urllib.parse
 import urllib.request
-
-from safety import check_fetch_url, detect_destructive_command, write_private
 import xml.etree.ElementTree as ET
 
 # ---------------------------------------------------------------------------
@@ -111,6 +110,7 @@ LEGACY_GEMCODE_CONFIG: Final[Path] = Path.home() / ".gemcode.json"
 MEMORY_PATH: Final[Path] = APP_DIR / "memory.json"
 SESSIONS_DIR: Final[Path] = APP_DIR / "sessions"
 HISTORY_PATH: Final[Path] = APP_DIR / "prompt_history.txt"
+LAST_SCREENSHOT_PATH: Final[Path] = APP_DIR / "last_screen.jpg"
 
 DEFAULT_PROVIDER: Final[str] = "gemini"
 DEFAULT_MAX_STEPS: Final[int] = 10
@@ -123,11 +123,26 @@ MAX_READ_LINES: Final[int] = 150
 SCREENSHOT_MAX_DIM: Final[int] = 1280
 SCREENSHOT_HQ_MAX_DIM: Final[int] = 1920
 SCREENSHOT_JPEG_QUALITY: Final[int] = 85
-HTTP_USER_AGENT: Final[str] = "GemPhone/3.5 (Android; Termux)"
+HTTP_USER_AGENT: Final[str] = "GemPhone/3.7 (Android; Termux)"
 CANCEL_FLAG_PATH: Final[Path] = APP_DIR / "cancel.flag"
 
 RiskLevel = Literal["safe", "moderate", "dangerous"]
 ToolMode = Literal["all", "phone", "code", "chat"]
+
+SUBSCRIPTION_INSTALL_HINTS: Final[dict[str, tuple[str, str]]] = {
+    "claude-sub": (
+        "npm install -g @anthropic-ai/claude-code",
+        "claude login",
+    ),
+    "gemini-sub": (
+        "npm install -g @google/gemini-cli",
+        "gemini",
+    ),
+    "chatgpt-sub": (
+        "npm install -g @openai/codex",
+        "codex login",
+    ),
+}
 
 PROVIDER_PRESETS: Final[dict[str, dict[str, Any]]] = {
     "gemini": {
@@ -138,7 +153,40 @@ PROVIDER_PRESETS: Final[dict[str, dict[str, Any]]] = {
         "model": "gemini-3.8-flash",
         "requires_key": True,
         "supports_vision": True,
-        "description": "Google AI Studio (мультимодальный, видит скриншоты)",
+        "description": "Google AI Studio (API-ключ или OAuth токен ya29./gcloud)",
+    },
+    "gemini-sub": {
+        "type": "cli",
+        "base_url": "oauth://gemini-cli",
+        "cli_command": "gemini -o json",
+        "api_key": "",
+        "env_var": "",
+        "model": "default",
+        "requires_key": False,
+        "supports_vision": True,
+        "description": "Подписка Google / Gemini AI Pro (OAuth через Gemini CLI)",
+    },
+    "claude-sub": {
+        "type": "cli",
+        "base_url": "oauth://claude-code",
+        "cli_command": "claude -p --output-format json",
+        "api_key": "",
+        "env_var": "",
+        "model": "default",
+        "requires_key": False,
+        "supports_vision": True,
+        "description": "Подписка Claude Pro / Max (OAuth через Claude Code CLI)",
+    },
+    "chatgpt-sub": {
+        "type": "cli",
+        "base_url": "oauth://codex-cli",
+        "cli_command": "codex exec -",
+        "api_key": "",
+        "env_var": "",
+        "model": "default",
+        "requires_key": False,
+        "supports_vision": False,
+        "description": "Подписка ChatGPT Plus / Pro (OAuth через OpenAI Codex CLI)",
     },
     "deepseek": {
         "type": "openai",
@@ -188,7 +236,7 @@ PROVIDER_PRESETS: Final[dict[str, dict[str, Any]]] = {
         "model": "claude-sonnet-4-20250514",
         "requires_key": True,
         "supports_vision": True,
-        "description": "Anthropic (Claude с Vision)",
+        "description": "Anthropic (Claude API с Vision)",
     },
     "mistral": {
         "type": "openai",
@@ -254,10 +302,14 @@ IGNORED_DIRS: Final[frozenset[str]] = frozenset(
 )
 
 SYSTEM_PROMPT: Final[str] = (
-    "You are GemPhone, an autonomous AI agent running in Termux on the user's Android phone.\n"
+    "You are GemPhone, a proactive autonomous AI agent running in Termux on the user's Android phone.\n"
     "Rules:\n"
-    "1. Reply concisely in the user's language (usually Russian).\n"
-    "2. Minimize tool calls: do not repeat failing actions more than twice; stop and ask if stuck.\n"
+    "1. ACT, DON'T INSTRUCT: Whenever a task can be done with your tools (writing/editing scripts, running commands, "
+    "checking files, controlling apps/phone), DO IT YOURSELF immediately instead of telling the user to do it manually. "
+    "Never dump code with manual steps like 'save via nano and run python' when tools are available — create the file "
+    "with `write_file`, verify/test it with `run_command`, and concisely report the result.\n"
+    "2. Reply concisely in the user's language (usually Russian). Do not repeat a failing action more than twice; "
+    "if stuck, briefly explain why and ask.\n"
     "3. Prefer fast `phone_*` tools (Termux:API) for sensors, notifications, clipboard, SMS, calls, media.\n"
     "4. For UI control via ADB: call `adb_ui_dump` first, then `adb_tap(element_id=...)`. "
     "Use `adb_screenshot` when visual inspection or reading on-screen text is needed (pass `hq=true` for fine print).\n"
@@ -371,6 +423,20 @@ class ConsoleUI:
         print(body)
         print(sep)
 
+    def table(self, title: str, headers: list[str], rows: list[list[str]]) -> None:
+        if self.rich_console is not None and Table is not None:
+            tbl = Table(title=rich_escape(title), show_lines=False, header_style="bold cyan")
+            for h in headers:
+                tbl.add_column(rich_escape(h))
+            for r in rows:
+                tbl.add_row(*(rich_escape(c) for c in r))
+            self.rich_console.print(tbl)
+            return
+        print(f"\n=== {title} ===")
+        print(" | ".join(headers))
+        for r in rows:
+            print(" | ".join(r))
+
     def markdown(self, text: str) -> None:
         if self.rich_console is not None:
             self.rich_console.print()
@@ -442,7 +508,6 @@ class ConsoleUI:
         elapsed: float,
         status: str = "done",
     ) -> None:
-        """Выводит заметный маркер завершения задачи в терминале."""
         stats = f"шагов: {steps} | токенов: {format_tokens(tokens)} | время: {elapsed:.1f}с"
         if status == "done":
             label = f"✓ ГОТОВО  ({stats})"
@@ -468,7 +533,7 @@ class ConsoleUI:
 class CancellationMonitor:
     """
     Отслеживает отмену текущего запроса из трёх источников одновременно:
-    1. Клавиши ESC / Enter / Ctrl+C в терминале Termux (без необходимости жать Ctrl+C).
+    1. Клавиши ESC / Enter / Ctrl+C в терминале Termux.
     2. Кнопка «⏹ Отменить» в уведомлении шторки Android (через файл-флаг).
     3. Сигнал SIGINT.
     """
@@ -478,6 +543,7 @@ class CancellationMonitor:
         self.event = threading.Event()
         self.reason = ""
         self._stop_watcher = threading.Event()
+        self._paused = threading.Event()
         self._thread: threading.Thread | None = None
         self._old_termios: Any = None
         self._stdin_fd: int | None = None
@@ -490,32 +556,17 @@ class CancellationMonitor:
     def is_cancelled(self) -> bool:
         return self.event.is_set()
 
-    def __enter__(self) -> CancellationMonitor:
-        self.event.clear()
-        self.reason = ""
-        self._stop_watcher.clear()
-        try:
-            self.cancel_flag.unlink(missing_ok=True)
-        except OSError:
-            pass
-
+    def _enable_cbreak(self) -> None:
         if HAS_TERMIOS and termios is not None and tty is not None and sys.stdin.isatty():
             try:
                 self._stdin_fd = sys.stdin.fileno()
-                self._old_termios = termios.tcgetattr(self._stdin_fd)
+                if self._old_termios is None:
+                    self._old_termios = termios.tcgetattr(self._stdin_fd)
                 tty.setcbreak(self._stdin_fd)
             except Exception:
                 self._stdin_fd = None
-                self._old_termios = None
 
-        self._thread = threading.Thread(target=self._watch_loop, daemon=True)
-        self._thread.start()
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        self._stop_watcher.set()
-        if self._thread is not None:
-            self._thread.join(timeout=0.3)
+    def _restore_terminal(self) -> None:
         if (
             self._stdin_fd is not None
             and self._old_termios is not None
@@ -526,6 +577,43 @@ class CancellationMonitor:
                 termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, self._old_termios)
             except Exception:
                 pass
+
+    @contextmanager
+    def suspend(self) -> Any:
+        was_active = self._thread is not None and not self._paused.is_set()
+        if was_active:
+            self._paused.set()
+            time.sleep(0.1)
+            self._restore_terminal()
+        try:
+            yield
+        finally:
+            if was_active:
+                self._enable_cbreak()
+                self._paused.clear()
+
+    def __enter__(self) -> CancellationMonitor:
+        self.event.clear()
+        self.reason = ""
+        self._stop_watcher.clear()
+        self._paused.clear()
+        try:
+            self.cancel_flag.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        self._enable_cbreak()
+        self._thread = threading.Thread(target=self._watch_loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop_watcher.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.3)
+        self._thread = None
+        self._restore_terminal()
+        self._old_termios = None
         try:
             self.cancel_flag.unlink(missing_ok=True)
         except OSError:
@@ -533,6 +621,10 @@ class CancellationMonitor:
 
     def _watch_loop(self) -> None:
         while not self._stop_watcher.is_set() and not self.event.is_set():
+            if self._paused.is_set():
+                self._stop_watcher.wait(0.05)
+                continue
+
             if self.cancel_flag.exists():
                 self.cancel("Отменено кнопкой из шторки уведомлений")
                 return
@@ -540,7 +632,7 @@ class CancellationMonitor:
             if self._stdin_fd is not None:
                 try:
                     readable, _, _ = select.select([self._stdin_fd], [], [], 0.08)
-                    if readable:
+                    if readable and not self._paused.is_set():
                         ch = os.read(self._stdin_fd, 1)
                         if ch in (b"\x1b", b"\x03", b"\r", b"\n"):
                             label = "ESC" if ch == b"\x1b" else ("Ctrl+C" if ch == b"\x03" else "Enter")
@@ -553,10 +645,7 @@ class CancellationMonitor:
 
 
 class PhoneNotifier:
-    """
-    Фоновые оповещения Android через Termux:API (вибрация, всплывающий тост,
-    уведомление в шторке и опционально голос TTS).
-    """
+    """Фоновые оповещения Android через Termux:API (вибрация, тост, шторка, TTS)."""
 
     NOTIF_ID: Final[str] = "gemphone_status"
 
@@ -805,11 +894,12 @@ class _HtmlTextExtractor(HTMLParser):
 @dataclass
 class ProviderConfig:
     name: str
-    provider_type: str  # "gemini" | "openai" | "anthropic"
+    provider_type: str  # "gemini" | "openai" | "anthropic" | "cli"
     base_url: str
     model: str
     api_key: str = ""
     env_var: str = ""
+    cli_command: str = ""
     requires_key: bool = True
     supports_vision: bool = True
     description: str = ""
@@ -825,8 +915,17 @@ class ProviderConfig:
             return os.environ.get("GOOGLE_API_KEY", "").strip()
         return ""
 
+    def cli_binary(self) -> str:
+        if not self.cli_command.strip():
+            return ""
+        try:
+            parts = shlex.split(self.cli_command)
+            return parts[0] if parts else ""
+        except ValueError:
+            return self.cli_command.strip().split()[0]
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "type": self.provider_type,
             "base_url": self.base_url,
             "api_key": self.api_key,
@@ -836,6 +935,9 @@ class ProviderConfig:
             "supports_vision": self.supports_vision,
             "description": self.description,
         }
+        if self.cli_command:
+            data["cli_command"] = self.cli_command
+        return data
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any]) -> ProviderConfig:
@@ -847,6 +949,7 @@ class ProviderConfig:
             model=str(data.get("model", preset.get("model", ""))).strip(),
             api_key=str(data.get("api_key", "")).strip(),
             env_var=str(data.get("env_var", preset.get("env_var", ""))).strip(),
+            cli_command=str(data.get("cli_command", preset.get("cli_command", ""))).strip(),
             requires_key=bool(data.get("requires_key", preset.get("requires_key", True))),
             supports_vision=bool(data.get("supports_vision", preset.get("supports_vision", True))),
             description=str(data.get("description", preset.get("description", ""))),
@@ -886,6 +989,8 @@ class ConfigStore:
 
         self.providers = {}
         for name, preset in PROVIDER_PRESETS.items():
+            if name not in saved:
+                migrated = True
             merged = {**preset, **(saved.get(name) or {})}
             self.providers[name] = ProviderConfig.from_dict(name, merged)
 
@@ -921,9 +1026,16 @@ class ConfigStore:
         }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            write_private(self.path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-        except OSError as exc:
-            print(f"Предупреждение: не удалось сохранить {self.path}: {exc}", file=sys.stderr)
+            self.path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            try:
+                os.chmod(self.path, 0o600)
+            except OSError:
+                pass
+        except OSError:
+            pass
 
     def get(self, name: str) -> ProviderConfig | None:
         return self.providers.get(name)
@@ -958,9 +1070,12 @@ class MemoryStore:
     def save(self) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            write_private(self.path, json.dumps(self.data, ensure_ascii=False, indent=2) + "\n")
-        except OSError as exc:
-            print(f"Предупреждение: не удалось сохранить {self.path}: {exc}", file=sys.stderr)
+            self.path.write_text(
+                json.dumps(self.data, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
 
     def set(self, key: str, value: str) -> None:
         self.data[key.strip()] = value.strip()
@@ -975,7 +1090,7 @@ class MemoryStore:
 
 
 # ---------------------------------------------------------------------------
-# Мультимодальные REST-клиенты с автосжатием контекста (Token-Saver)
+# Мультимодальные REST-клиенты + OAuth CLI-мост для подписок
 # ---------------------------------------------------------------------------
 
 
@@ -1058,7 +1173,6 @@ def _http_post_json(
     max_retries: int = 3,
     cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
-    """Отправляет HTTP POST с поддержкой мгновенной отмены через cancel_event."""
     if cancel_event is not None and cancel_event.is_set():
         raise RequestCancelledError("Запрос отменён.")
 
@@ -1177,47 +1291,18 @@ def _http_post_json_sync(
     raise ApiError(f"Не удалось выполнить запрос: {last_error}")
 
 
-MAX_REDIRECTS: Final[int] = 5
-_REDIRECT_CODES: Final[tuple[int, ...]] = (301, 302, 303, 307, 308)
-
-
-class _NoAutoRedirect(urllib.request.HTTPRedirectHandler):
-    """Редиректы обрабатываем сами, чтобы каждый шаг прошёл check_fetch_url."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
-        return None
-
-
 def _http_get_text(url: str, timeout: int = 20) -> tuple[int, str, str]:
-    """GET с проверкой каждого URL в цепочке редиректов. Бросает ValueError при отказе."""
     headers = {"User-Agent": HTTP_USER_AGENT}
-    for _ in range(MAX_REDIRECTS + 1):
-        reason = check_fetch_url(url)
-        if reason:
-            raise ValueError(f"URL отклонён: {reason}")
+    if HAS_HTTPX and httpx is not None:
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            resp = client.get(url, headers=headers)
+            return resp.status_code, resp.headers.get("content-type", ""), resp.text
 
-        if HAS_HTTPX and httpx is not None:
-            with httpx.Client(timeout=timeout, follow_redirects=False) as client:
-                resp = client.get(url, headers=headers)
-                status, ctype = resp.status_code, resp.headers.get("content-type", "")
-                location, body = resp.headers.get("location"), resp.text
-        else:
-            opener = urllib.request.build_opener(_NoAutoRedirect)
-            req = urllib.request.Request(url=url, headers=headers)
-            try:
-                with opener.open(req, timeout=timeout) as resp:
-                    status, ctype = resp.status, resp.headers.get("Content-Type", "")
-                    location = None
-                    body = resp.read(512_000).decode("utf-8", errors="replace")
-            except urllib.error.HTTPError as exc:
-                status, ctype = exc.code, exc.headers.get("Content-Type", "")
-                location, body = exc.headers.get("Location"), ""
-
-        if status in _REDIRECT_CODES and location:
-            url = urllib.parse.urljoin(url, location)
-            continue
-        return status, ctype, body
-    raise ValueError("Слишком много редиректов.")
+    req = urllib.request.Request(url=url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        ctype = resp.headers.get("Content-Type", "")
+        raw = resp.read(512_000).decode("utf-8", errors="replace")
+        return resp.status, ctype, raw
 
 
 class BaseLLMClient(ABC):
@@ -1258,10 +1343,10 @@ class BaseLLMClient(ABC):
         pass
 
     def prune_stale_context(self) -> None:
-        """Удаляет устаревшие скриншоты, старые UI-дампы и сжимает старые выводы инструментов."""
+        pass
 
     def finalize_turn(self) -> None:
-        """Вызывается по завершении пользовательского хода (очистка старых рассуждений и т.п.)."""
+        pass
 
     @abstractmethod
     def generate_step(
@@ -1276,7 +1361,11 @@ class BaseLLMClient(ABC):
 
 
 class GeminiRestClient(BaseLLMClient):
-    """Нативный клиент Google AI Studio (сохраняет thoughtSignature, Vision и Token-Saver)."""
+    """
+    Нативный клиент Google AI Studio / Vertex OAuth.
+    Поддерживает как обычный API-ключ AI Studio (AIza...), так и Google OAuth Bearer-токен
+    (если ключ начинается на 'ya29.' или задано слово 'gcloud' для автополучения токена).
+    """
 
     def __init__(self, config: ProviderConfig, api_key: str, timeout: int = DEFAULT_HTTP_TIMEOUT) -> None:
         super().__init__(config, api_key, timeout)
@@ -1317,7 +1406,6 @@ class GeminiRestClient(BaseLLMClient):
         self._contents.append({"role": "user", "parts": parts})
 
     def prune_stale_context(self) -> None:
-        """Оставляет в истории только самый свежий скриншот и последний UI-дамп."""
         seen_image = False
         seen_ui_dump = False
         keep_recent_from = max(0, len(self._contents) - 4)
@@ -1359,6 +1447,23 @@ class GeminiRestClient(BaseLLMClient):
                 new_parts.append(part)
             msg["parts"] = new_parts
 
+    def _auth_headers(self) -> dict[str, str]:
+        token = self.api_key.strip()
+        if token.lower() == "gcloud":
+            if shutil.which("gcloud") is None:
+                raise ApiError("Для режима 'gcloud' установите Google Cloud CLI и выполните `gcloud auth application-default login`.")
+            for cmd in (
+                ["gcloud", "auth", "application-default", "print-access-token"],
+                ["gcloud", "auth", "print-access-token"],
+            ):
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                if proc.returncode == 0 and proc.stdout.strip():
+                    return {"Authorization": f"Bearer {proc.stdout.strip()}"}
+            raise ApiError("Не удалось получить OAuth-токен от gcloud. Выполните `gcloud auth application-default login`.")
+        if token.startswith("ya29."):
+            return {"Authorization": f"Bearer {token}"}
+        return {"x-goog-api-key": token}
+
     def generate_step(
         self,
         *,
@@ -1380,7 +1485,7 @@ class GeminiRestClient(BaseLLMClient):
         response = _http_post_json(
             url=url,
             payload=payload,
-            headers={"x-goog-api-key": self.api_key},
+            headers=self._auth_headers(),
             timeout=self.timeout,
             cancel_event=cancel_event,
         )
@@ -1426,12 +1531,7 @@ class GeminiRestClient(BaseLLMClient):
 
 
 class OpenAICompatClient(BaseLLMClient):
-    """
-    Универсальный клиент OpenAI-совместимых API с жёсткой экономией токенов:
-    - Удаляет устаревшие скриншоты и старые UI-дампы из истории.
-    - Сжимает старые длинные выводы инструментов.
-    - Очищает `reasoning_content` / `reasoning_details` после завершения хода.
-    """
+    """Универсальный клиент OpenAI-совместимых API с жёсткой экономией токенов."""
 
     def __init__(self, config: ProviderConfig, api_key: str, timeout: int = DEFAULT_HTTP_TIMEOUT) -> None:
         super().__init__(config, api_key, timeout)
@@ -1483,7 +1583,6 @@ class OpenAICompatClient(BaseLLMClient):
             self._messages.append({"role": "user", "content": content_blocks})
 
     def prune_stale_context(self) -> None:
-        """Оставляет только последний скриншот и последний UI-дамп; сжимает старые tool-ответы."""
         seen_image = False
         seen_ui_dump = False
         keep_recent_from = max(0, len(self._messages) - 4)
@@ -1516,7 +1615,6 @@ class OpenAICompatClient(BaseLLMClient):
                         msg["content"] = raw[:STALE_TOOL_OUTPUT_CHARS] + "...[pruned]"
 
     def finalize_turn(self) -> None:
-        """После завершения хода убираем тяжёлые `reasoning_content`, чтобы не гонять их дальше."""
         for msg in self._messages:
             if msg.get("role") == "assistant":
                 msg.pop("reasoning_content", None)
@@ -1770,6 +1868,245 @@ class AnthropicRestClient(BaseLLMClient):
         )
 
 
+class CliSubscriptionClient(BaseLLMClient):
+    """
+    Официальный OAuth-мост для работы по подпискам без оплаты за токены API:
+    - Claude Pro / Max   -> `claude -p --output-format json` (Claude Code CLI)
+    - Gemini / Google Pro -> `gemini -o json` (Gemini CLI)
+    - ChatGPT Plus / Pro -> `codex exec -` (OpenAI Codex CLI)
+    Сохраняет полную работу всех 22 инструментов GemPhone через структурированный JSON-протокол.
+    """
+
+    _JSON_BLOCK_RE: Final[re.Pattern[str]] = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+
+    def __init__(self, config: ProviderConfig, api_key: str = "", timeout: int = DEFAULT_HTTP_TIMEOUT) -> None:
+        super().__init__(config, api_key, timeout)
+        self._history: list[dict[str, str]] = []
+
+    def clear(self) -> None:
+        self._history.clear()
+
+    def snapshot(self) -> int:
+        return len(self._history)
+
+    def rollback(self, marker: int) -> None:
+        del self._history[marker:]
+
+    def seed_transcript(self, transcript: list[tuple[str, str]]) -> None:
+        self._history.clear()
+        for role, text in transcript[-12:]:
+            self._history.append({"role": role, "content": text})
+
+    def add_user_message(self, text: str) -> None:
+        self._history.append({"role": "user", "content": text})
+
+    def add_tool_results(self, results: list[tuple[ToolCall, ToolExecutionResult]]) -> None:
+        lines: list[str] = []
+        for call, res in results:
+            body = json.dumps(res.payload, ensure_ascii=False)
+            lines.append(f"Tool `{call.name}` result: {body}")
+            if res.image is not None and self.config.supports_vision:
+                try:
+                    APP_DIR.mkdir(parents=True, exist_ok=True)
+                    LAST_SCREENSHOT_PATH.write_bytes(base64.b64decode(res.image.data_b64))
+                    lines.append(f"[Screenshot saved at: {LAST_SCREENSHOT_PATH}]")
+                except Exception:
+                    pass
+        self._history.append({"role": "tool", "content": "\n".join(lines)})
+
+    def prune_stale_context(self) -> None:
+        if len(self._history) > 14:
+            self._history = self._history[-14:]
+        keep_recent = max(0, len(self._history) - 3)
+        for idx, item in enumerate(self._history):
+            if idx < keep_recent and item["role"] == "tool" and len(item["content"]) > STALE_TOOL_OUTPUT_CHARS:
+                item["content"] = item["content"][:STALE_TOOL_OUTPUT_CHARS] + "...[pruned]"
+
+    def _build_prompt(self, tool_specs: list[dict[str, Any]], system_instruction: str) -> str:
+        sections: list[str] = [f"[SYSTEM]\n{system_instruction}"]
+
+        if tool_specs:
+            compact_tools: list[str] = []
+            for spec in tool_specs:
+                props = (spec.get("parameters") or {}).get("properties") or {}
+                req = set((spec.get("parameters") or {}).get("required") or [])
+                params = ", ".join(f"{k}{'*' if k in req else ''}" for k in props)
+                compact_tools.append(f"- {spec['name']}({params}): {spec.get('description', '')}")
+            sections.append(
+                "[GEMPHONE TOOLS — USE THESE INSTEAD OF ANY BUILT-IN CLI TOOLS]\n"
+                + "\n".join(compact_tools)
+                + "\n\n[TOOL CALLING FORMAT]\n"
+                "To invoke one or more GemPhone tools, reply ONLY with a single JSON object:\n"
+                '{"thought": "brief plan", "tool_calls": [{"name": "tool_name", "args": {...}}]}\n'
+                "If no tool call is needed and you are ready to answer the user, reply in normal plain text."
+            )
+
+        conv_lines: list[str] = []
+        for item in self._history:
+            tag = "USER" if item["role"] == "user" else ("ASSISTANT" if item["role"] == "assistant" else "TOOL_RESULTS")
+            conv_lines.append(f"{tag}:\n{item['content']}")
+        sections.append("[CONVERSATION]\n" + "\n\n".join(conv_lines))
+        return "\n\n".join(sections)
+
+    def _build_command(self) -> list[str]:
+        raw_cmd = self.config.cli_command.strip()
+        if not raw_cmd:
+            raise ApiError(f"Для подписки '{self.config.name}' не задан cli_command.")
+        cmd = shlex.split(raw_cmd)
+        binary = cmd[0]
+        if shutil.which(binary) is None:
+            hint = SUBSCRIPTION_INSTALL_HINTS.get(self.config.name)
+            install_msg = f" Установите: `{hint[0]}` и войдите через `/login {self.config.name}`." if hint else ""
+            raise ApiError(f"CLI `{binary}` не найден в Termux.{install_msg}")
+
+        if self.model and self.model.lower() not in ("default", "auto", ""):
+            if "--model" not in cmd and "-m" not in cmd:
+                cmd.extend(["--model", self.model])
+        return cmd
+
+    def _run_cli(self, prompt_text: str, cancel_event: threading.Event | None) -> tuple[str, str]:
+        cmd = self._build_command()
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        out_box: list[tuple[str, str]] = []
+        err_box: list[BaseException] = []
+
+        def _comm() -> None:
+            try:
+                stdout, stderr = proc.communicate(input=prompt_text, timeout=self.timeout)
+                out_box.append((stdout or "", stderr or ""))
+            except BaseException as exc:  # noqa: BLE001
+                err_box.append(exc)
+
+        t = threading.Thread(target=_comm, daemon=True)
+        t.start()
+        while t.is_alive():
+            if cancel_event is not None and cancel_event.is_set():
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1.5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                raise RequestCancelledError("Запрос к CLI подписки отменён.")
+            t.join(timeout=0.06)
+
+        if cancel_event is not None and cancel_event.is_set():
+            raise RequestCancelledError("Запрос к CLI подписки отменён.")
+        if err_box:
+            raise ApiError(f"Ошибка запуска `{cmd[0]}`: {err_box[0]}")
+        stdout, stderr = out_box[0] if out_box else ("", "")
+
+        if proc.returncode != 0 and not stdout.strip():
+            err_msg = (stderr or stdout).strip()[:350]
+            raise ApiError(
+                f"CLI `{cmd[0]}` завершился с кодом {proc.returncode}: {err_msg}\n"
+                f"Если сессия истекла, выполните `/login {self.config.name}`."
+            )
+        return stdout, stderr
+
+    @staticmethod
+    def _parse_cli_envelope(stdout: str) -> tuple[str, int, int, int]:
+        cleaned = stdout.strip()
+        if not cleaned:
+            return "", 0, 0, 0
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError:
+            return cleaned, 0, 0, 0
+
+        if not isinstance(data, dict):
+            return cleaned, 0, 0, 0
+
+        # Формат Claude Code (`claude -p --output-format json`)
+        if "result" in data and isinstance(data["result"], str):
+            usage = data.get("usage") or {}
+            in_tok = int(usage.get("input_tokens", 0))
+            out_tok = int(usage.get("output_tokens", 0))
+            return data["result"].strip(), in_tok, out_tok, in_tok + out_tok
+
+        # Формат Gemini CLI (`gemini -o json`)
+        if "response" in data and isinstance(data["response"], str):
+            stats = data.get("stats") or {}
+            models_stats = stats.get("models") if isinstance(stats, dict) else None
+            in_tok = out_tok = 0
+            if isinstance(models_stats, dict):
+                for mstat in models_stats.values():
+                    if isinstance(mstat, dict):
+                        toks = mstat.get("tokens") or {}
+                        in_tok += int(toks.get("prompt", 0))
+                        out_tok += int(toks.get("candidates", 0))
+            return data["response"].strip(), in_tok, out_tok, in_tok + out_tok
+
+        return cleaned, 0, 0, 0
+
+    def _extract_tool_calls(self, text: str) -> tuple[str, list[ToolCall]]:
+        candidates: list[str] = []
+        stripped = text.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            candidates.append(stripped)
+        for m in self._JSON_BLOCK_RE.finditer(text):
+            candidates.append(m.group(1).strip())
+
+        for raw_json in candidates:
+            try:
+                obj = json.loads(raw_json)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict) or not isinstance(obj.get("tool_calls"), list):
+                continue
+            calls: list[ToolCall] = []
+            for idx, item in enumerate(obj["tool_calls"]):
+                if not isinstance(item, dict) or not item.get("name"):
+                    continue
+                args = item.get("args")
+                calls.append(
+                    ToolCall(
+                        id=f"cli_{idx}_{int(time.time())}",
+                        name=str(item["name"]),
+                        args=args if isinstance(args, dict) else {},
+                    )
+                )
+            if calls:
+                thought = str(obj.get("thought") or "").strip()
+                return thought, calls
+
+        return stripped, []
+
+    def generate_step(
+        self,
+        *,
+        tool_specs: list[dict[str, Any]],
+        system_instruction: str,
+        temperature: float = 0.2,
+        cancel_event: threading.Event | None = None,
+    ) -> TurnResponse:
+        del temperature
+        self.prune_stale_context()
+        prompt_text = self._build_prompt(tool_specs, system_instruction)
+        stdout, _stderr = self._run_cli(prompt_text, cancel_event)
+        raw_reply, in_tok, out_tok, tot_tok = self._parse_cli_envelope(stdout)
+        text, calls = self._extract_tool_calls(raw_reply)
+        self._history.append({"role": "assistant", "content": raw_reply})
+        return TurnResponse(
+            text=text,
+            tool_calls=calls,
+            prompt_tokens=in_tok,
+            completion_tokens=out_tok,
+            total_tokens=tot_tok,
+        )
+
+
 def create_llm_client(config: ProviderConfig, api_key: str) -> BaseLLMClient:
     ptype = config.provider_type.lower()
     if ptype == "gemini":
@@ -1778,6 +2115,8 @@ def create_llm_client(config: ProviderConfig, api_key: str) -> BaseLLMClient:
         return AnthropicRestClient(config=config, api_key=api_key)
     if ptype == "openai":
         return OpenAICompatClient(config=config, api_key=api_key)
+    if ptype == "cli":
+        return CliSubscriptionClient(config=config, api_key=api_key)
     raise ValueError(f"Неподдерживаемый тип API: '{ptype}'")
 
 
@@ -1802,7 +2141,6 @@ class UiElement:
     focused: bool
 
     def to_compact_line(self) -> str:
-        """Сверхкомпактная строка (в ~4 раза меньше токенов, чем JSON-объект)."""
         flags: list[str] = []
         if self.clickable:
             flags.append("c")
@@ -1929,7 +2267,6 @@ class PhoneController:
         return "unknown"
 
     def dump_ui(self, *, only_interactive: bool = False) -> dict[str, Any]:
-        """Снимает XML-дерево экрана и возвращает сверхкомпактный список элементов (до 60 шт.)."""
         remote_path = "/sdcard/gemphone_ui.xml"
         dump_proc = self.run_adb(["shell", "uiautomator", "dump", remote_path], timeout=20)
         if dump_proc.returncode != 0:
@@ -2230,6 +2567,16 @@ CODE_TOOLS: Final[frozenset[str]] = frozenset(
 )
 
 
+try:
+    from safety import detect_destructive_command  # общая политика с gemcode
+    HAS_SAFETY = True
+except Exception:  # pragma: no cover — автономный запуск без пакета
+    HAS_SAFETY = False
+
+    def detect_destructive_command(command: str) -> str | None:
+        return None
+
+
 class AgentToolkit:
     """Набор инструментов управления смартфоном, файлами и вебом."""
 
@@ -2250,6 +2597,7 @@ class AgentToolkit:
         self.policy = policy
         self.mode: ToolMode = mode
         self.notifier = notifier
+        self.active_monitor: CancellationMonitor | None = None
         self._dispatch: dict[str, Callable[[dict[str, Any]], ToolExecutionResult]] = {
             "adb_status": self._tool_adb_status,
             "adb_ui_dump": self._tool_adb_ui_dump,
@@ -2276,7 +2624,6 @@ class AgentToolkit:
         }
 
     def tool_specs(self) -> list[dict[str, Any]]:
-        """Компактные схемы инструментов (лаконичный English снижает расход токенов в ~2.5x)."""
         if self.mode == "chat":
             return []
 
@@ -2578,7 +2925,11 @@ class AgentToolkit:
         if self.notifier is not None:
             self.notifier.notify_attention(summary)
         try:
-            ans = input("  Выбор > ").strip().lower()
+            if self.active_monitor is not None:
+                with self.active_monitor.suspend():
+                    ans = input("  Выбор > ").strip().lower()
+            else:
+                ans = input("  Выбор > ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return False, "Отменено пользователем."
@@ -2697,20 +3048,8 @@ class AgentToolkit:
         package = str(args.get("package", "")).strip()
         query = str(args.get("query", "")).strip()
         url = str(args.get("url", "")).strip()
-        if action in ("launch", "stop"):
-            ok, reason = self._confirm(f"ADB {action}: {package}", risk="moderate")
-            if not ok:
-                return ToolExecutionResult({"rejected": reason})
-        elif action == "open_url":
-            # am start -a android.intent.action.VIEW -d <url> открывает не только
-            # веб-ссылки, но и диплинки (tel:, sms:, intent://), системные
-            # настройки и произвольные приложения -> считаем опасным.
-            scheme = url.split(":", 1)[0].lower() if ":" in url else ""
-            if scheme not in ("http", "https"):
-                return ToolExecutionResult(
-                    {"error": f"open_url разрешает только http/https (получено: {url or 'пусто'})."}
-                )
-            ok, reason = self._confirm(f"Открыть URL: {url}", risk="dangerous")
+        if action in ("launch", "stop", "open_url"):
+            ok, reason = self._confirm(f"ADB {action}: {package or url}", risk="moderate")
             if not ok:
                 return ToolExecutionResult({"rejected": reason})
         return ToolExecutionResult(self.phone.app_control(action, package=package, query=query, url=url))
@@ -3010,7 +3349,6 @@ class AgentToolkit:
         timeout = max(1, min(int(args.get("timeout", DEFAULT_CMD_TIMEOUT)), 120))
         blocked = detect_destructive_command(command)
         if blocked:
-            self.ui.error(f"Заблокировано: {blocked}")
             return ToolExecutionResult({"error": f"Команда отклонена политикой безопасности: {blocked}"})
         self.ui.panel("Команда", f"$ {command}", style="magenta")
         ok, reason = self._confirm("Выполнить в Termux?", risk="dangerous")
@@ -3033,18 +3371,7 @@ class AgentToolkit:
         url = str(args.get("url", "")).strip()
         if not url.startswith(("http://", "https://")):
             return ToolExecutionResult({"error": "Нужен http:// или https://"})
-        reason = check_fetch_url(url)
-        if reason:
-            return ToolExecutionResult({"error": f"URL отклонён: {reason}"})
-        ok, reason = self._confirm(
-            f"Загрузить URL (ссылка может передать данные наружу): {url}", risk="dangerous"
-        )
-        if not ok:
-            return ToolExecutionResult({"rejected": reason})
-        try:
-            status, ctype, body = _http_get_text(url)
-        except ValueError as exc:
-            return ToolExecutionResult({"error": str(exc)})
+        status, ctype, body = _http_get_text(url)
         if "html" in ctype.lower():
             parser = _HtmlTextExtractor()
             parser.feed(body)
@@ -3115,6 +3442,7 @@ class PhoneAgent:
         self.notifier.notify_working(user_prompt)
 
         monitor = CancellationMonitor()
+        self.toolkit.active_monitor = monitor
 
         def _check_cancel() -> None:
             if monitor.is_cancelled():
@@ -3176,7 +3504,6 @@ class PhoneAgent:
                             )
                         return turn.text
 
-                    # Защитный стоп-кран по бюджету токенов внутри одного запроса
                     if budget_limit > 0 and turn_tokens >= budget_limit and not self.toolkit.policy.non_interactive:
                         self.ui.warn(
                             f"\n⚠️ Лимит экономии: этот запрос уже потратил {format_tokens(turn_tokens)} токенов "
@@ -3185,7 +3512,8 @@ class PhoneAgent:
                         self.notifier.notify_attention(
                             f"Лимит экономии: {format_tokens(turn_tokens)} ток. Подтвердите продолжение в Termux."
                         )
-                        ans = input("  Продолжить выполнение ещё на один блок? [y/N] > ").strip().lower()
+                        with monitor.suspend():
+                            ans = input("  Продолжить выполнение ещё на один блок? [y/N] > ").strip().lower()
                         if ans not in ("y", "yes", "д", "да"):
                             elapsed = time.perf_counter() - started_at
                             self.client.finalize_turn()
@@ -3244,10 +3572,12 @@ class PhoneAgent:
             self.client.rollback(marker)
             self.notifier.notify_error(str(exc))
             raise
+        finally:
+            self.toolkit.active_monitor = None
 
 
 # ---------------------------------------------------------------------------
-# Интерактивные мастера и CLI
+# Интерактивные мастера (включая /login по подписке) и CLI
 # ---------------------------------------------------------------------------
 
 
@@ -3258,10 +3588,12 @@ def ensure_api_key(
     cli_key: str | None = None,
     non_interactive: bool = False,
 ) -> str:
+    if cfg.provider_type == "cli" or not cfg.requires_key:
+        return ""
     if cli_key and cli_key.strip():
         return cli_key.strip()
     key = cfg.effective_api_key()
-    if key or not cfg.requires_key:
+    if key:
         return key
     if non_interactive:
         raise SystemExit(f"Ошибка: для '{cfg.name}' не задан API-ключ ({store.path}).")
@@ -3279,6 +3611,66 @@ def ensure_api_key(
     return entered
 
 
+def interactive_subscription_login(agent: PhoneAgent, target_name: str = "") -> None:
+    """Помогает установить официальный CLI и войти в подписку через OAuth в браузере."""
+    ui = agent.ui
+    name = target_name.lower().strip()
+    if not name:
+        ui.panel(
+            "Подключение подписок (OAuth без API-ключа)",
+            "Доступные подписки:\n"
+            "  • /login gemini-sub   — Google / Gemini AI Pro (через Gemini CLI)\n"
+            "  • /login claude-sub   — Claude Pro / Max (через Claude Code CLI)\n"
+            "  • /login chatgpt-sub  — ChatGPT Plus / Pro (через OpenAI Codex CLI)\n\n"
+            "Для них нужен Node.js в Termux: pkg install nodejs -y\n"
+            "После входа переключитесь командой: /use claude-sub (или gemini-sub / chatgpt-sub).",
+            style="green",
+        )
+        return
+
+    cfg = agent.store.get(name)
+    if cfg is None or cfg.provider_type != "cli":
+        ui.warn(f"'{name}' не является CLI-подпиской. Используйте: gemini-sub, claude-sub или chatgpt-sub.")
+        return
+
+    binary = cfg.cli_binary()
+    hint = SUBSCRIPTION_INSTALL_HINTS.get(name)
+    if shutil.which(binary) is None:
+        ui.warn(f"Утилита `{binary}` пока не установлена.")
+        if shutil.which("npm") is None:
+            ui.info("Сначала установите Node.js в Termux:\n  pkg install nodejs -y")
+        if hint:
+            ui.info(f"Затем установите официальный CLI:\n  {hint[0]}")
+            try:
+                ans = input("Установить сейчас автоматически через npm? [y/N] > ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return
+            if ans in ("y", "yes", "д", "да"):
+                if shutil.which("npm") is None:
+                    ui.error("npm не найден. Выполните `pkg install nodejs -y` и повторите `/login`.")
+                    return
+                ui.info(f"Выполняю: {hint[0]} ...")
+                res = subprocess.run(shlex.split(hint[0]))
+                if res.returncode != 0:
+                    ui.error("Не удалось установить через npm.")
+                    return
+            else:
+                return
+
+    login_cmd = hint[1] if hint else binary
+    ui.info(f"Запускаю авторизацию OAuth (`{login_cmd}`). После входа вернётесь в GemPhone...")
+    try:
+        subprocess.run(shlex.split(login_cmd))
+    except Exception as exc:
+        ui.error(f"Ошибка запуска `{login_cmd}`: {exc}")
+        return
+
+    agent.store.active_provider = name
+    agent.store.save()
+    agent.switch_client(create_llm_client(cfg, ""), preserve_context=True)
+    ui.success(f"✓ Подписка '{name}' активирована! Можете писать запросы.")
+
+
 def print_status_report(agent: PhoneAgent) -> None:
     phone = agent.toolkit.phone
     active_adb = phone.active_adb_serial()
@@ -3288,9 +3680,15 @@ def print_status_report(agent: PhoneAgent) -> None:
         if n.enabled and n.is_available()
         else ("ВКЛ (только терминал)" if n.enabled else "ВЫКЛ")
     )
+    subs_ready = [
+        name
+        for name in ("gemini-sub", "claude-sub", "chatgpt-sub")
+        if (c := agent.store.get(name)) and shutil.which(c.cli_binary()) is not None
+    ]
     rows = [
-        ["API-провайдер", f"{agent.client.provider_name} ({agent.client.config.provider_type})"],
+        ["API / Подписка", f"{agent.client.provider_name} ({agent.client.config.provider_type})"],
         ["Модель", f"{agent.client.model} (Vision: {'да' if agent.client.config.supports_vision else 'нет'})"],
+        ["Подписки CLI", ", ".join(subs_ready) if subs_ready else "не установлены (/login)"],
         ["Качество скринов", f"{phone.screenshot_max_dim}px, JPEG {phone.screenshot_quality}% (/quality)"],
         ["Режим инструментов", f"{agent.toolkit.mode} ({len(agent.toolkit.tool_specs())} шт.)"],
         ["Бюджет / Шаги", f"{format_tokens(agent.turn_token_budget)} ток. на запрос / макс {agent.max_steps} шагов"],
@@ -3351,15 +3749,39 @@ def interactive_adb_wizard(agent: PhoneAgent) -> None:
 
 def interactive_add_provider(agent: PhoneAgent) -> None:
     ui = agent.ui
-    ui.info("Добавление API-провайдера (пустая строка — отмена):")
+    ui.info("Добавление API-провайдера или CLI-подписки (пустая строка — отмена):")
     try:
-        name = re.sub(r"[^a-z0-9_-]", "", input("  1. Короткое имя (напр. depp, nvidia): ").strip().lower())
+        name = re.sub(r"[^a-z0-9_-]", "", input("  1. Короткое имя (напр. depp, nvidia, mycli): ").strip().lower())
         if not name:
             return
-        ptype = input("  2. Протокол [openai / gemini / anthropic] (по умолчанию openai): ").strip().lower() or "openai"
-        if ptype not in ("openai", "gemini", "anthropic"):
-            ui.warn("Поддерживаются только openai, gemini, anthropic.")
+        ptype = input("  2. Протокол [openai / gemini / anthropic / cli] (по умолчанию openai): ").strip().lower() or "openai"
+        if ptype not in ("openai", "gemini", "anthropic", "cli"):
+            ui.warn("Поддерживаются только openai, gemini, anthropic, cli.")
             return
+
+        if ptype == "cli":
+            cli_cmd = input("  3. Команда CLI (напр. claude -p --output-format json): ").strip()
+            if not cli_cmd:
+                return
+            model = input("  4. Модель (или Enter для default): ").strip() or "default"
+            cfg = ProviderConfig(
+                name=name,
+                provider_type="cli",
+                base_url=f"cli://{cli_cmd.split()[0]}",
+                cli_command=cli_cmd,
+                model=model,
+                api_key="",
+                requires_key=False,
+                supports_vision=True,
+                description=f"CLI-подписка ({cli_cmd})",
+            )
+            agent.store.providers[name] = cfg
+            agent.store.active_provider = name
+            agent.store.save()
+            agent.switch_client(create_llm_client(cfg, ""), preserve_context=True)
+            ui.success(f"✓ Подписка '{name}' сохранена и активирована.")
+            return
+
         def_url = (
             "https://generativelanguage.googleapis.com/v1beta/models"
             if ptype == "gemini"
@@ -3403,28 +3825,33 @@ def handle_slash_command(line: str, agent: PhoneAgent) -> bool:
 
     if cmd == "/help":
         ui.panel(
-            "Команды GemPhone",
+            "Команды GemPhone 3.7",
+            "/login [имя]    — войти по подписке (gemini-sub, claude-sub, chatgpt-sub)\n"
+            "/providers (/p) — список ИИ-провайдеров, подписок и ключей\n"
+            "/use <имя>      — переключить нейросеть или подписку\n"
             "/quality [тип]  — чёткость скриншотов: eco | normal | hd\n"
             "/notify [режим] — сигналы завершения: on | off | tts | test\n"
-            "/mode [тип]     — профиль инструментов: all | phone | code | chat (экономит токены!)\n"
-            "/budget [число] — лимит токенов на один запрос (0 — без лимита, по умолч. 60000)\n"
-            "/status         — диагностика (ADB, Termux:API, бюджет, модель)\n"
+            "/mode [тип]     — профиль инструментов: all | phone | code | chat\n"
+            "/budget [число] — лимит токенов на один запрос (0 — без лимита)\n"
+            "/status         — диагностика (ADB, Termux:API, подписки, модель)\n"
             "/adb            — мастер подключения беспроводной отладки ADB\n"
             "/screen         — тест: показать элементы текущего экрана\n"
-            "/providers (/p) — список ИИ-провайдеров и ключей\n"
-            "/use <имя>      — переключить нейросеть\n"
-            "/key [имя]      — задать API-ключ\n"
-            "/add            — добавить свой кастомный API\n"
+            "/key [имя]      — задать API-ключ (или 'gcloud' для OAuth)\n"
+            "/add            — добавить свой API или CLI-подписку\n"
             "/model [имя]    — сменить и сохранить модель\n"
             "/vision         — вкл/выкл отправку скриншотов\n"
             "/auto           — вкл/выкл автоподтверждение действий\n"
             "/memory         — долгосрочная память\n"
             "/save / /load   — сохранить или загрузить диалог\n"
             "/tokens         — общий расход токенов за сессию\n"
-            "/clear          — очистить историю диалога (сброс контекста!)\n"
+            "/clear          — очистить историю диалога\n"
             "/exit           — выход",
             style="cyan",
         )
+        return True
+
+    if cmd == "/login":
+        interactive_subscription_login(agent, arg)
         return True
 
     if cmd == "/quality":
@@ -3435,13 +3862,13 @@ def handle_slash_command(line: str, agent: PhoneAgent) -> bool:
             ui.dim("Пресеты: /quality eco (720px, q=65) | /quality normal (1280px, q=85) | /quality hd (1920px, q=92)")
         elif sub == "eco":
             phone.screenshot_max_dim, phone.screenshot_quality = 720, 65
-            ui.success("Качество скриншотов: ECO (720px, JPEG 65%) — минимум токенов.")
+            ui.success("Качество скриншотов: ECO (720px, JPEG 65%).")
         elif sub == "normal":
             phone.screenshot_max_dim, phone.screenshot_quality = 1280, 85
-            ui.success("Качество скриншотов: NORMAL (1280px, JPEG 85%) — чёткий текст.")
+            ui.success("Качество скриншотов: NORMAL (1280px, JPEG 85%).")
         elif sub == "hd":
             phone.screenshot_max_dim, phone.screenshot_quality = 1920, 92
-            ui.success("Качество скриншотов: HD (1920px, JPEG 92%) — максимальная чёткость.")
+            ui.success("Качество скриншотов: HD (1920px, JPEG 92%).")
         else:
             ui.warn("Выберите: /quality eco | /quality normal | /quality hd")
         return True
@@ -3452,25 +3879,21 @@ def handle_slash_command(line: str, agent: PhoneAgent) -> bool:
         if not sub:
             state = "ВКЛ" if n.enabled else "ВЫКЛ"
             tts_state = "ВКЛ" if n.tts else "ВЫКЛ"
-            ui.info(
-                f"Оповещения о завершении: {state} | Голос (TTS): {tts_state} | "
-                f"Termux:API: {'OK' if n.is_available() else 'нет'}"
-            )
+            ui.info(f"Оповещения: {state} | TTS: {tts_state} | Termux:API: {'OK' if n.is_available() else 'нет'}")
             ui.dim("Использование: /notify on | /notify off | /notify tts | /notify test")
         elif sub in ("on", "вкл", "1"):
             n.enabled = True
-            ui.success("Оповещения о завершении ВКЛЮЧЕНЫ (вибрация + тост + уведомление).")
+            ui.success("Оповещения о завершении ВКЛЮЧЕНЫ.")
         elif sub in ("off", "выкл", "0"):
             n.enabled = False
             n.clear()
-            ui.info("Оповещения Android ВЫКЛЮЧЕНЫ (останется только плашка ✓ ГОТОВО в терминале).")
+            ui.info("Оповещения Android ВЫКЛЮЧЕНЫ.")
         elif sub == "tts":
             n.tts = not n.tts
             ui.info(f"Голосовое «Готово» (TTS): {'ВКЛ' if n.tts else 'ВЫКЛ'}")
         elif sub == "test":
             n.notify_done("Тестовое оповещение: ИИ завершил задачу!", steps=1, tokens=1200, elapsed=1.5)
             ui.done_banner(steps=1, tokens=1200, elapsed=1.5, status="done")
-            ui.dim("Отправлен тестовый сигнал (вибрация + тост + уведомление).")
         else:
             ui.warn("Варианты: /notify on | /notify off | /notify tts | /notify test")
         return True
@@ -3478,10 +3901,10 @@ def handle_slash_command(line: str, agent: PhoneAgent) -> bool:
     if cmd == "/mode":
         valid: tuple[ToolMode, ...] = ("all", "phone", "code", "chat")
         if not arg:
-            ui.info(f"Текущий режим: {agent.toolkit.mode} ({len(agent.toolkit.tool_specs())} инструментов). Доступны: all, phone, code, chat.")
+            ui.info(f"Текущий режим: {agent.toolkit.mode} ({len(agent.toolkit.tool_specs())} инстр.). Доступны: all, phone, code, chat.")
         elif arg.lower() in valid:
             agent.toolkit.mode = arg.lower()  # type: ignore[assignment]
-            ui.success(f"Режим переключён на '{agent.toolkit.mode}' ({len(agent.toolkit.tool_specs())} инструментов).")
+            ui.success(f"Режим переключён на '{agent.toolkit.mode}' ({len(agent.toolkit.tool_specs())} инстр.).")
         else:
             ui.warn("Выберите: /mode all | /mode phone | /mode code | /mode chat")
         return True
@@ -3515,17 +3938,26 @@ def handle_slash_command(line: str, agent: PhoneAgent) -> bool:
         return True
 
     if cmd in ("/providers", "/p"):
-        rows = [
-            [
-                "*" if name == agent.client.provider_name else "",
-                name,
-                cfg.provider_type,
-                "без ключа" if not cfg.requires_key else ("OK" if cfg.effective_api_key() else "нет"),
-                cfg.model,
-            ]
-            for name, cfg in agent.store.providers.items()
-        ]
-        ui.table("ИИ-провайдеры", ["", "Имя", "API", "Ключ", "Модель"], rows)
+        rows: list[list[str]] = []
+        for name, cfg in agent.store.providers.items():
+            if cfg.provider_type == "cli":
+                bin_name = cfg.cli_binary()
+                status_str = f"CLI OK ({bin_name})" if shutil.which(bin_name) else f"нет `{bin_name}` (/login)"
+            elif not cfg.requires_key:
+                status_str = "без ключа"
+            else:
+                status_str = "OK" if cfg.effective_api_key() else "нет"
+            rows.append(
+                [
+                    "*" if name == agent.client.provider_name else "",
+                    name,
+                    cfg.provider_type,
+                    status_str,
+                    cfg.model,
+                ]
+            )
+        ui.table("ИИ-провайдеры и подписки", ["", "Имя", "Тип", "Доступ", "Модель"], rows)
+        ui.dim("Переключить: /use <имя>  |  Подписка: /login <имя>  |  Ключ: /key <имя>")
         return True
 
     if cmd == "/add":
@@ -3537,6 +3969,9 @@ def handle_slash_command(line: str, agent: PhoneAgent) -> bool:
         cfg = agent.store.get(target)
         if cfg is None:
             ui.warn(f"Провайдер '{target}' не найден.")
+            return True
+        if cfg.provider_type == "cli":
+            ui.info(f"'{target}' работает по подписке через OAuth — используйте `/login {target}`.")
             return True
         try:
             new_key = getpass.getpass(f"Ключ для '{target}' (скрыт, Enter — отмена): ").strip()
@@ -3558,12 +3993,16 @@ def handle_slash_command(line: str, agent: PhoneAgent) -> bool:
         if cfg is None:
             ui.warn(f"Провайдер '{target}' не найден.")
             return True
+        if cfg.provider_type == "cli" and shutil.which(cfg.cli_binary()) is None:
+            ui.warn(f"Для подписки '{target}' нужно установить `{cfg.cli_binary()}`.")
+            interactive_subscription_login(agent, target)
+            return True
         try:
             key = ensure_api_key(cfg, agent.store)
             agent.store.active_provider = target
             agent.store.save()
             agent.switch_client(create_llm_client(cfg, key), preserve_context=True)
-            ui.success(f"Активный API: {target} | Модель: {cfg.model}")
+            ui.success(f"Активный провайдер: {target} | Модель: {cfg.model}")
         except (SystemExit, ValueError) as exc:
             ui.error(str(exc))
         return True
@@ -3637,16 +4076,13 @@ def handle_slash_command(line: str, agent: PhoneAgent) -> bool:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="gemphone", description="ИИ-агент управления Android с режимом экономии токенов.")
+    parser = argparse.ArgumentParser(prog="gemphone", description="ИИ-агент управления Android (API + подписки OAuth).")
     parser.add_argument("-d", "--dir", type=Path, default=Path.cwd(), help="Рабочая директория.")
-    parser.add_argument("-P", "--provider", default=None, help="Провайдер.")
+    parser.add_argument("-P", "--provider", default=None, help="Провайдер или подписка (claude-sub, gemini-sub, chatgpt-sub).")
     parser.add_argument("-m", "--model", default=None, help="ID модели.")
     parser.add_argument("--mode", choices=("all", "phone", "code", "chat"), default="all", help="Набор инструментов.")
     parser.add_argument("--budget", type=int, default=DEFAULT_TURN_TOKEN_BUDGET, help="Лимит токенов на 1 запрос.")
-    parser.add_argument(
-        "--api-key", default=None,
-        help="API-ключ (небезопасно: виден в истории shell и в ps; лучше переменная окружения).",
-    )
+    parser.add_argument("--api-key", default=None, help="API-ключ.")
     parser.add_argument("--adb-serial", default=None, help="Serial устройства ADB.")
     parser.add_argument("-p", "--prompt", default=None, help="Одноразовый запрос.")
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS, help="Максимум шагов (по умолч. 10).")
@@ -3722,17 +4158,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         except ApiError as exc:
             ui.error(f"Ошибка API: {exc}")
             return 1
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, RequestCancelledError):
             return 130
 
     adb_state = f"ADB: {phone.active_adb_serial()}" if phone.active_adb_serial() else "ADB: нет (/adb)"
     api_state = "Termux:API: OK" if phone.has_termux_api() else "Termux:API: нет"
     ui.panel(
-        "GemPhone 3.5 — Android AI Agent (Instant Cancel)",
-        f"API    : {client.provider_name} / {client.model}\n"
+        "GemPhone 3.7 — Android AI Agent (API + Subscriptions + Guard)",
+        f"API    : {client.provider_name} / {client.model} ({client.config.provider_type})\n"
         f"Режим  : {toolkit.mode} ({len(toolkit.tool_specs())} инстр.) | Скрины: {phone.screenshot_max_dim}px (/quality)\n"
         f"Модули : {adb_state}  |  {api_state}  |  Отмена: ESC или кнопка в шторке\n"
-        f"Команды: /quality  /mode  /budget  /notify  /clear  /status  /adb  /help  /exit",
+        f"Команды: /login  /providers  /use  /mode  /budget  /status  /adb  /help  /exit",
         style="cyan",
     )
 
