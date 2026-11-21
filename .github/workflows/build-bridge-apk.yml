@@ -52,10 +52,14 @@ jobs:
         working-directory: bridge
         run: |
           KEYSTORE=$RUNNER_TEMP/gemphone.keystore
-          keytool -genkeypair -v -keystore "$KEYSTORE" -alias gemphone \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass gemphone -keypass gemphone \
-            -dname "CN=GemPhone Bridge, O=Rafdante, C=RU" >/dev/null 2>&1
+          if [ -f tools/gemphone.keystore ]; then
+            cp tools/gemphone.keystore "$KEYSTORE"
+          else
+            keytool -genkeypair -v -keystore "$KEYSTORE" -alias gemphone \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass gemphone -keypass gemphone \
+              -dname "CN=GemPhone Bridge, O=Rafdante, C=RU" >/dev/null 2>&1
+          fi
           APKSIGNER=$(ls $ANDROID_SDK_ROOT/build-tools/*/apksigner | tail -1)
           APK=$(ls app/build/outputs/apk/debug/*.apk | head -1)
           "$APKSIGNER" sign --ks "$KEYSTORE" --ks-pass pass:gemphone \
