@@ -20,6 +20,11 @@ if [ -f "$REPO/bin/gemphone-bg.sh" ]; then
     echo "✓ gemphone-bg -> $DEST/gemphone-bg"
 fi
 
+if [ -f "$REPO/bin/gemagent.sh" ]; then
+    install -m 700 "$REPO/bin/gemagent.sh" "$DEST/gemagent"
+    echo "✓ gemagent -> $DEST/gemagent"
+fi
+
 for name_pair in "gemphone:gemphone.py" "gemcode:gemcode.py" "gemphone-daemon:gemphone_daemon.py"; do
     name="${name_pair%%:*}"
     target="${name_pair##*:}"

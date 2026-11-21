@@ -16,7 +16,7 @@ TOKEN=""
 api() {
   local payload="$1"
   if [ -n "$TOKEN" ]; then
-    curl -s -m 8 -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    curl -s -m 8 -H "x-gemphone-token: $TOKEN" -H "Content-Type: application/json" \
       -d "$payload" "http://127.0.0.1:$PORT/agent"
   else
     curl -s -m 8 -H "Content-Type: application/json" \
