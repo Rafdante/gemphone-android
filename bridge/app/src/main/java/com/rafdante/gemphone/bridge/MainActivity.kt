@@ -74,12 +74,16 @@ class MainActivity : Activity() {
             setOnClickListener {
                 if (!Settings.canDrawOverlays(this@MainActivity)) {
                     try {
-                        startActivity(
-                            Intent(
-                                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                Uri.parse("package:$packageName"),
-                            ),
-                        )
+                        try {
+                            startActivity(
+                                Intent(
+                                    "android.settings.action.MANAGE_OVERLAY_PERMISSION",
+                                    Uri.parse("package:$packageName"),
+                                ),
+                            )
+                        } catch (_: Exception) {
+                            startActivity(Intent(Settings.ACTION_SETTINGS))
+                        }
                     } catch (_: Exception) {
                     }
                     return@setOnClickListener
