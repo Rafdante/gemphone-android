@@ -116,7 +116,7 @@ except ImportError:
 # Константы, палитра Claude Code, лимиты и пресеты провайдеров
 # ---------------------------------------------------------------------------
 
-APP_VERSION: Final[str] = "3.8.1"
+APP_VERSION: Final[str] = "3.9.0"
 ACCENT: Final[str] = "#D97757"  # Фирменный тёплый терракотовый акцент в стиле Claude Code
 
 APP_DIR: Final[Path] = Path.home() / ".gemphone"
@@ -4952,6 +4952,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    _src_dir = str(Path(__file__).resolve().parent)
+    if _src_dir not in sys.path:
+        sys.path.insert(0, _src_dir)
+    try:
+        import fast_transport as _fast_transport
+        _fast_transport.patch_gemphone_runtime(sys.modules[__name__])
+    except Exception:
+        pass
     parser = build_parser()
     args = parser.parse_args(argv)
 
