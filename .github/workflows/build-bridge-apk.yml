@@ -48,8 +48,26 @@ jobs:
           echo "--- build dir ---"
           find build -maxdepth 3 -type f 2>/dev/null | head -30
 
+      - name: Sign & report keystore
+        working-directory: bridge
+        run: |
+          KEYSTORE=$RUNNER_TEMP/gemphone.keystore
+          keytool -genkeypair -v -keystore "$KEYSTORE" -alias gemphone \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass gemphone -keypass gemphone \
+            -dname "CN=GemPhone Bridge, O=Rafdante, C=RU" >/dev/null 2>&1
+          APKSIGNER=$(ls $ANDROID_SDK_ROOT/build-tools/*/apksigner | tail -1)
+          APK=$(ls app/build/outputs/apk/debug/*.apk | head -1)
+          "$APKSIGNER" sign --ks "$KEYSTORE" --ks-pass pass:gemphone \
+            --key-pass pass:gemphone --ks-key-alias gemphone "$APK"
+          echo "::notice::Signed APK: $(basename "$APK")"
+          "$APKSIGNER" verify --print-certs "$APK" | head -5
+          cp "$KEYSTORE" app/build/outputs/gemphone.keystore
+
       - uses: actions/upload-artifact@v4
         with:
           name: gemphone-bridge-debug
-          path: bridge/app/build/outputs/apk/debug/*.apk
+          path: |
+            bridge/app/build/outputs/apk/**/*.apk
+            bridge/app/build/outputs/gemphone.keystore
           if-no-files-found: error
