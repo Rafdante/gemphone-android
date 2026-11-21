@@ -252,6 +252,26 @@ class LocalHttpServer(
                         method == "POST" && path == "/batch" -> {
                             writeJson(output, 200, service.performBatch(body), keepAlive)
                         }
+                        method == "POST" && path == "/agent" -> {
+                            val action = body.optString("action", "start")
+                            val text = body.optString("text", "работает")
+                            val detail = if (body.has("detail")) body.optString("detail") else null
+                            val overlay = body.optBoolean("overlay", true)
+                            when (action) {
+                                "stop" -> GemAgentService.stop(service)
+                                "update" -> GemAgentService.update(service, text, detail)
+                                else -> GemAgentService.start(service, text, detail, overlay)
+                            }
+                            val running = GemOverlay.isShown()
+                            writeJson(
+                                output, 200,
+                                JSONObject().put("ok", true)
+                                    .put("action", action)
+                                    .put("running", running)
+                                    .put("overlay_permission", android.provider.Settings.canDrawOverlays(service)),
+                                keepAlive,
+                            )
+                        }
                         else -> writeJson(output, 404, JSONObject().put("error", "not_found"), keepAlive)
                     }
                 } catch (e: Exception) {

@@ -69,6 +69,28 @@ class MainActivity : Activity() {
             text = "2. Включить в Спец. возможностях"
             setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
         }
+        val btnAgent = Button(this).apply {
+            text = "▶ Агент в фоне (капсула поверх приложений)"
+            setOnClickListener {
+                if (!Settings.canDrawOverlays(this@MainActivity)) {
+                    try {
+                        startActivity(
+                            Intent(
+                                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                Uri.parse("package:$packageName"),
+                            ),
+                        )
+                    } catch (_: Exception) {
+                    }
+                    return@setOnClickListener
+                }
+                GemAgentService.start(this@MainActivity, "работает", "можно пользоваться телефоном")
+            }
+        }
+        val btnAgentStop = Button(this).apply {
+            text = "■ Остановить фоновый режим"
+            setOnClickListener { GemAgentService.stop(this@MainActivity) }
+        }
         val btnCopy = Button(this).apply {
             text = "3. Скопировать команду для GemPhone"
             setOnClickListener {
@@ -87,7 +109,7 @@ class MainActivity : Activity() {
             }
         }
 
-        listOf(title, statusView, batteryView, tokenView, btnAppInfo, btnBattery, btnSettings, btnCopy, btnRotate)
+        listOf(title, statusView, batteryView, tokenView, btnAppInfo, btnBattery, btnSettings, btnAgent, btnAgentStop, btnCopy, btnRotate)
             .forEach { root.addView(it) }
         setContentView(root)
     }
