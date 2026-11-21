@@ -252,6 +252,49 @@ class LocalHttpServer(
                         method == "POST" && path == "/batch" -> {
                             writeJson(output, 200, service.performBatch(body), keepAlive)
                         }
+                        method == "POST" && path == "/vdisplay" -> {
+                            val action = body.optString("action", "status")
+                            val result = JSONObject()
+                            when (action) {
+                                "create" -> {
+                                    val w = body.optInt("width", 1080)
+                                    val h = body.optInt("height", 2344)
+                                    val dpi = body.optInt("dpi", 420)
+                                    val id = GemVirtualDisplay.create(service, w, h, dpi)
+                                    result.put("ok", id >= 0).put("display_id", id)
+                                }
+                                "stop" -> {
+                                    GemVirtualDisplay.stop()
+                                    result.put("ok", true)
+                                }
+                                "launch" -> {
+                                    val pkg = body.optString("package", "")
+                                    val id = body.optInt("display_id", GemVirtualDisplay.currentDisplayId())
+                                    val ok = GemVirtualDisplay.launchOnDisplay(service, pkg, id)
+                                    result.put("ok", ok).put("display_id", id).put("package", pkg)
+                                }
+                                "tap" -> {
+                                    val id = body.optInt("display_id", GemVirtualDisplay.currentDisplayId())
+                                    val ok = ShellRunner.tapOnDisplay(id, body.optInt("x"), body.optInt("y"))
+                                    result.put("ok", ok).put("display_id", id)
+                                }
+                                "swipe" -> {
+                                    val id = body.optInt("display_id", GemVirtualDisplay.currentDisplayId())
+                                    val ok = ShellRunner.swipeOnDisplay(
+                                        id,
+                                        body.optInt("x1"), body.optInt("y1"),
+                                        body.optInt("x2"), body.optInt("y2"),
+                                        body.optInt("duration_ms", 300),
+                                    )
+                                    result.put("ok", ok).put("display_id", id)
+                                }
+                                else -> result.put("ok", GemVirtualDisplay.isRunning())
+                                    .put("display_id", GemVirtualDisplay.currentDisplayId())
+                            }
+                            result.put("shizuku", ShellRunner.isShizuku())
+                            result.put("running", GemVirtualDisplay.isRunning())
+                            writeJson(output, 200, result, keepAlive)
+                        }
                         method == "POST" && path == "/agent" -> {
                             val action = body.optString("action", "start")
                             val text = body.optString("text", "работает")
