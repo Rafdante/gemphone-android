@@ -70,7 +70,6 @@ try:
     from prompt_toolkit import PromptSession  # type: ignore[import-not-found]
     from prompt_toolkit.completion import Completer, Completion  # type: ignore[import-not-found]
     from prompt_toolkit.formatted_text import HTML  # type: ignore[import-not-found]
-    from prompt_toolkit.history import FileHistory  # type: ignore[import-not-found]
     from prompt_toolkit.styles import Style as PTStyle  # type: ignore[import-not-found]
 
     HAS_PROMPT_TOOLKIT = True
@@ -79,7 +78,6 @@ except ImportError:
     Completer = object  # type: ignore[assignment,misc]
     Completion = None  # type: ignore[assignment]
     HTML = None  # type: ignore[assignment]
-    FileHistory = None  # type: ignore[assignment]
     PTStyle = None  # type: ignore[assignment]
     HAS_PROMPT_TOOLKIT = False
 
@@ -124,7 +122,6 @@ CONFIG_PATH: Final[Path] = APP_DIR / "config.json"
 LEGACY_GEMCODE_CONFIG: Final[Path] = Path.home() / ".gemcode.json"
 MEMORY_PATH: Final[Path] = APP_DIR / "memory.json"
 SESSIONS_DIR: Final[Path] = APP_DIR / "sessions"
-HISTORY_PATH: Final[Path] = APP_DIR / "prompt_history.txt"
 LAST_SCREENSHOT_PATH: Final[Path] = APP_DIR / "last_screen.jpg"
 CANCEL_FLAG_PATH: Final[Path] = APP_DIR / "cancel.flag"
 BRIDGE_TOKEN_PATH: Final[Path] = APP_DIR / "bridge.token"
@@ -3647,16 +3644,45 @@ class AgentToolkit:
         return all_specs
 
     def execute(self, name: str, args: dict[str, Any] | None) -> ToolExecutionResult:
+        if self.mode not in ("all", "phone", "code", "chat") or not any(
+            spec["name"] == name for spec in self.tool_specs()
+        ):
+            return ToolExecutionResult({"rejected": "Инструмент запрещён текущим режимом."})
         handler = self._dispatch.get(name)
         if handler is None:
             return ToolExecutionResult({"error": f"Неизвестный инструмент: {name}"})
         safe_args = args if isinstance(args, dict) else {}
         try:
+            action = str(safe_args.get("action", "")).lower()
+            private_read = (
+                name in ("adb_ui_dump", "adb_screenshot")
+                or (name == "phone_batch" and bool(safe_args.get("auto_dump", True)))
+                or (name == "phone_comms" and action in ("list_sms", "search_contacts"))
+                or (name == "phone_notifications" and action == "list")
+                or (name == "phone_clipboard" and action == "get")
+                or (name == "phone_sensors" and str(safe_args.get("kind", "")).lower() in ("location", "wifi", "wifi_scan"))
+            )
+            if private_read and not self._allow_private_read(name):
+                return ToolExecutionResult({"rejected": "Передача личных данных не разрешена."})
             return handler(safe_args)
         except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired, RequestCancelledError) as exc:
             return ToolExecutionResult({"error": str(exc)})
         except Exception as exc:
             return ToolExecutionResult({"error": f"Ошибка {name}: {exc}"})
+
+    def _allow_private_read(self, name: str) -> bool:
+        if self.policy.non_interactive:
+            return False
+        self.ui.panel("Личные данные", f"{name}: результат будет доступен текущему провайдеру модели.")
+        try:
+            if self.active_monitor is not None:
+                with self.active_monitor.suspend():
+                    answer = input("Разрешить один раз? [y/N] ")
+            else:
+                answer = input("Разрешить один раз? [y/N] ")
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return answer.strip().lower() in ("y", "yes", "д", "да")
 
     def _confirm(self, summary: str, *, risk: RiskLevel) -> tuple[bool, str]:
         if risk == "safe":
@@ -4958,8 +4984,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         import fast_transport as _fast_transport
         _fast_transport.patch_gemphone_runtime(sys.modules[__name__])
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"Не удалось загрузить политику инструментов: {type(exc).__name__}", file=sys.stderr)
+        return 1
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -5042,7 +5069,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     prompt_session = None
     pt_style = None
-    if HAS_PROMPT_TOOLKIT and PromptSession is not None and FileHistory is not None and PTStyle is not None:
+    if HAS_PROMPT_TOOLKIT and PromptSession is not None and PTStyle is not None:
         try:
             APP_DIR.mkdir(parents=True, exist_ok=True)
             pt_style = PTStyle.from_dict(
@@ -5056,7 +5083,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
             )
             prompt_session = PromptSession(
-                history=FileHistory(str(HISTORY_PATH)),
                 completer=_SlashCompleter(),
                 complete_while_typing=True,
                 style=pt_style,

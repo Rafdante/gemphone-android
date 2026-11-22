@@ -33,8 +33,10 @@ class GemAccessibilityService : AccessibilityService() {
         @Volatile var lastPackage: String = "unknown"
 
         private const val PREFS = "gemphone_bridge_prefs"
-        private const val KEY_TOKEN = "auth_token"
+        // Old versions exported the previous preference to shared storage.
+        private const val KEY_TOKEN = "private_auth_token_v2"
 
+        @Synchronized
         fun getOrCreateToken(context: Context): String {
             val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             val existing = prefs.getString(KEY_TOKEN, null)
@@ -42,31 +44,13 @@ class GemAccessibilityService : AccessibilityService() {
             return rotateToken(context)
         }
 
-        /** Дублируем токен в Download, чтобы Termux мог его прочитать. */
-        private fun mirrorToken(context: Context, token: String) {
-            try {
-                val values = android.content.ContentValues().apply {
-                    put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, "gemphone_bridge_token.txt")
-                    put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "text/plain")
-                    put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH,
-                        android.os.Environment.DIRECTORY_DOWNLOADS)
-                }
-                val resolver = context.contentResolver
-                val uri = resolver.insert(
-                    android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return
-                resolver.openOutputStream(uri)?.use { it.write(token.toByteArray()) }
-            } catch (e: Exception) {
-                android.util.Log.w("GemBridge", "mirrorToken: ${e.message}")
-            }
-        }
-
+        @Synchronized
         fun rotateToken(context: Context): String {
             val bytes = ByteArray(24)
             SecureRandom().nextBytes(bytes)
             val token = bytes.joinToString("") { "%02x".format(it) }
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                .edit().putString(KEY_TOKEN, token).apply()
-            mirrorToken(context, token)
+                .edit().remove("auth_token").putString(KEY_TOKEN, token).apply()
             return token
         }
     }
@@ -77,7 +61,6 @@ class GemAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
-        mirrorToken(this, getOrCreateToken(this))
         server = LocalHttpServer(this, port = 7331, tokenProvider = { getOrCreateToken(this) })
         server?.start()
     }
@@ -144,8 +127,8 @@ class GemAccessibilityService : AccessibilityService() {
                     rect.left < w && rect.top < h
 
                 if (onScreen) {
-                    val text = node.text?.toString()?.trim().orEmpty()
-                    val desc = node.contentDescription?.toString()?.trim().orEmpty()
+                    val text = if (node.isPassword) "" else node.text?.toString()?.trim().orEmpty()
+                    val desc = if (node.isPassword) "" else node.contentDescription?.toString()?.trim().orEmpty()
                     val resId = node.viewIdResourceName.orEmpty()
                     val cls = node.className?.toString().orEmpty()
                     val editable = node.isEditable || cls.contains("EditText") || cls.contains("AutoComplete")

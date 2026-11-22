@@ -39,33 +39,32 @@ class SilentUI(gp.ConsoleUI):
         self.ansi = False
 
     def info(self, text: str) -> None:
-        log.info("%s", text)
+        pass
 
     def dim(self, text: str) -> None:
-        log.debug("%s", text)
+        pass
 
     def success(self, text: str) -> None:
-        log.info("OK: %s", text)
+        pass
 
     def warn(self, text: str) -> None:
-        log.warning("%s", text)
+        log.warning("Предупреждение агента")
 
     def error(self, text: str) -> None:
-        log.error("%s", text)
+        log.error("Ошибка агента")
 
     def panel(self, title: str, body: str, style: str = "") -> None:
-        del style
-        log.info("[%s] %s", title, body.replace("\n", " | "))
+        pass
 
     def markdown(self, text: str) -> None:
-        log.info("ANSWER: %s", text[:300])
+        pass
 
     def tool_tree_result(self, name: str, args: dict[str, Any], status: str, summary: str) -> None:
-        log.info("TOOL %s(%s) -> %s: %s", name, gp._format_tool_args(args), status, summary)
+        log.info("TOOL %s -> %s", name, status)
 
     def diff(self, old_text: str, new_text: str, filename: str) -> None:
         del old_text, new_text
-        log.info("DIFF %s", filename)
+        log.info("DIFF")
 
     def done_banner(self, *, steps: int, tokens: int, elapsed: float, status: str = "done") -> None:
         log.info("DONE status=%s steps=%d tokens=%d elapsed=%.1fs", status, steps, tokens, elapsed)
@@ -244,7 +243,7 @@ class DaemonRunner:
             processing.unlink(missing_ok=True)
             return
 
-        log.info("Задача [%s]: %s", task_id, text[:140])
+        log.info("Задача получена")
         try:
             meta_reply = self._handle_meta(text)
             if meta_reply is not None:
@@ -259,7 +258,7 @@ class DaemonRunner:
             self._write_result(task_id, True, answer, meta)
             processing.unlink(missing_ok=True)
         except Exception as exc:
-            log.exception("Ошибка задачи [%s]: %s", task_id, exc)
+            log.error("Ошибка задачи: %s", type(exc).__name__)
             err_msg = f"Ошибка фонового агента: {exc}"
             self._write_result(task_id, False, err_msg)
             self.notifier.notify_error(err_msg)

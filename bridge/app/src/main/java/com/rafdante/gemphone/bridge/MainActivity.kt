@@ -101,7 +101,11 @@ class MainActivity : Activity() {
                 val tok = GemAccessibilityService.getOrCreateToken(this@MainActivity)
                 val cmd = "/bridge token $tok"
                 val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                cm.setPrimaryClip(ClipData.newPlainText("GemPhone Bridge Token", cmd))
+                val clip = ClipData.newPlainText("GemPhone Bridge Token", cmd)
+                clip.description.extras = android.os.PersistableBundle().apply {
+                    putBoolean("android.content.extra.IS_SENSITIVE", true)
+                }
+                cm.setPrimaryClip(clip)
                 Toast.makeText(this@MainActivity, "Скопировано: вставь в GemPhone", Toast.LENGTH_SHORT).show()
             }
         }
@@ -149,7 +153,6 @@ class MainActivity : Activity() {
             if (unrestricted) Color.parseColor("#4ADE80") else Color.parseColor("#FACC15")
         )
 
-        val tok = GemAccessibilityService.getOrCreateToken(this)
-        tokenView.text = "Token: ${tok.take(8)}...${tok.takeLast(6)}"
+        tokenView.text = "Для сопряжения скопируйте команду в Termux."
     }
 }

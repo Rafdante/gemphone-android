@@ -630,7 +630,11 @@ def patch_gemphone_runtime(gp: Any) -> None:
         steps = args.get("steps")
         if not isinstance(steps, list) or not steps:
             return gp.ToolExecutionResult({"error": "Передайте непустой массив steps."})
-        ok, reason = self._confirm(f"Серия из {len(steps)} действий на экране (Bridge batch)", risk="moderate")
+        risk = "dangerous" if any(
+            isinstance(step, dict) and str(step.get("op", "")).lower() == "app"
+            and str(step.get("action", "")).lower() == "open_url" for step in steps
+        ) else "moderate"
+        ok, reason = self._confirm(f"Серия из {len(steps)} действий на экране (Bridge batch)", risk=risk)
         if not ok:
             return gp.ToolExecutionResult({"rejected": reason})
         return gp.ToolExecutionResult(
