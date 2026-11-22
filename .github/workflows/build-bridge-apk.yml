@@ -4,10 +4,25 @@ on:
   push:
     paths:
       - "bridge/**"
+      - "src/**.py"
+      - "tests/**"
       - ".github/workflows/build-bridge-apk.yml"
+  pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
+  policy-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest discover -s tests -v
+
   build:
     runs-on: ubuntu-latest
     steps:
@@ -48,30 +63,8 @@ jobs:
           echo "--- build dir ---"
           find build -maxdepth 3 -type f 2>/dev/null | head -30
 
-      - name: Sign & report keystore
-        working-directory: bridge
-        run: |
-          KEYSTORE=$RUNNER_TEMP/gemphone.keystore
-          if [ -f "$GITHUB_WORKSPACE/tools/gemphone.keystore" ]; then
-            cp "$GITHUB_WORKSPACE/tools/gemphone.keystore" "$KEYSTORE"
-          else
-            keytool -genkeypair -v -keystore "$KEYSTORE" -alias gemphone \
-              -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass gemphone -keypass gemphone \
-              -dname "CN=GemPhone Bridge, O=Rafdante, C=RU" >/dev/null 2>&1
-          fi
-          APKSIGNER=$(ls $ANDROID_SDK_ROOT/build-tools/*/apksigner | tail -1)
-          APK=$(ls app/build/outputs/apk/debug/*.apk | head -1)
-          "$APKSIGNER" sign --ks "$KEYSTORE" --ks-pass pass:gemphone \
-            --key-pass pass:gemphone --ks-key-alias gemphone "$APK"
-          echo "::notice::Signed APK: $(basename "$APK")"
-          "$APKSIGNER" verify --print-certs "$APK" | head -5
-          cp "$KEYSTORE" app/build/outputs/gemphone.keystore
-
       - uses: actions/upload-artifact@v4
         with:
           name: gemphone-bridge-debug
-          path: |
-            bridge/app/build/outputs/apk/**/*.apk
-            bridge/app/build/outputs/gemphone.keystore
+          path: bridge/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error

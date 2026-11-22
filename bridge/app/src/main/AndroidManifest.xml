@@ -10,6 +10,7 @@
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
+        android:allowBackup="false"
         android:label="GemPhone Bridge"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
 
