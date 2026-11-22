@@ -1,9 +1,11 @@
 package com.rafdante.gemphone.bridge
 
 import android.content.Context
+import android.graphics.PixelFormat
 import android.graphics.Point
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
 import android.os.Handler
 import android.os.Looper
 import android.view.Display
@@ -12,13 +14,13 @@ import android.view.Surface
 /**
  * Виртуальный дисплей «второй экран» — агент работает на нём, не занимая экран пользователя.
  *
- * Создаётся через Shizuku (uid shell), т.к. системный сервис требует прав системы.
  * Использование:
  *   GemVirtualDisplay.create(ctx, width, height, dpi) -> id дисплея или null
  *   GemVirtualDisplay.stop()
  */
 object GemVirtualDisplay {
     private var vd: VirtualDisplay? = null
+    private var imageReader: ImageReader? = null
     private var displayId: Int = -1
     private val main = Handler(Looper.getMainLooper())
 
@@ -31,19 +33,35 @@ object GemVirtualDisplay {
         if (vd != null) return displayId
         val dm = ctx.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
         try {
-            // PRIVATE-дисплей разрешён любому приложению без permissions
-            val flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
+            // Реальный Surface обязателен: с null дисплей создаётся в state OFF
+            // и Activity на него не выводятся.
+            val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+            reader.setOnImageAvailableListener({ r ->
+                try { r.acquireLatestImage()?.close() } catch (_: Exception) {}
+            }, main)
+            imageReader = reader
+            // Без OWN_CONTENT_ONLY: с ним на дисплей выводятся только Activity
+            // самого бриджа, а TikTok и другие приложения ActivityManager отклоняет.
+            val flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH
             vd = dm.createVirtualDisplay(
                 "gemphone-agent-vd",
                 width,
                 height,
                 dpi,
-                null as Surface?,
+                reader.surface,
                 flags,
             )
             displayId = vd?.display?.displayId ?: -1
+            if (displayId < 0) {
+                reader.close()
+                imageReader = null
+                vd = null
+            }
         } catch (e: Exception) {
             android.util.Log.w("GemVD", "createVirtualDisplay failed: ${e.message}")
+            try { imageReader?.close() } catch (_: Exception) {}
+            imageReader = null
             vd = null
             displayId = -1
         }
@@ -52,11 +70,10 @@ object GemVirtualDisplay {
 
     fun stop() {
         main.post {
-            try {
-                vd?.release()
-            } catch (_: Exception) {
-            }
+            try { vd?.release() } catch (_: Exception) {}
+            try { imageReader?.close() } catch (_: Exception) {}
             vd = null
+            imageReader = null
             displayId = -1
         }
     }
