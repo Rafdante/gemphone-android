@@ -252,6 +252,23 @@ class LocalHttpServer(
                         method == "POST" && path == "/batch" -> {
                             writeJson(output, 200, service.performBatch(body), keepAlive)
                         }
+                        method == "GET" && path == "/vdisplay/screenshot" -> {
+                            val asPng = qParams["format"]?.lowercase() != "jpeg"
+                            val quality = qParams["quality"]?.toIntOrNull() ?: 85
+                            val bytes = GemVirtualDisplay.captureFrame(asPng, quality)
+                            if (bytes != null) {
+                                writeBytes(output, 200, if (asPng) "image/png" else "image/jpeg", bytes, keepAlive)
+                            } else {
+                                writeJson(
+                                    output,
+                                    404,
+                                    JSONObject()
+                                        .put("error", "no frame yet (display not running or nothing rendered)")
+                                        .put("vd", GemVirtualDisplay.statusJson()),
+                                    keepAlive
+                                )
+                            }
+                        }
                         method == "POST" && path == "/vdisplay" -> {
                             val action = body.optString("action", "status")
                             val result = JSONObject()
@@ -272,7 +289,10 @@ class LocalHttpServer(
                                         val w = body.optInt("width", 1080)
                                         val h = body.optInt("height", 2344)
                                         val dpi = body.optInt("dpi", 420)
-                                        val id = GemVirtualDisplay.create(service, w, h, dpi)
+                                        val id = GemVirtualDisplay.create(
+                                            service, w, h, dpi,
+                                            if (body.has("flags")) body.optInt("flags") else GemVirtualDisplay.DEFAULT_FLAGS,
+                                        )
                                         result.put("ok", id >= 0).put("display_id", id)
                                     }
                                 }
@@ -283,8 +303,9 @@ class LocalHttpServer(
                                 "launch" -> {
                                     val pkg = body.optString("package", "")
                                     val id = body.optInt("display_id", GemVirtualDisplay.currentDisplayId())
-                                    val ok = GemVirtualDisplay.launchOnDisplay(service, pkg, id)
-                                    result.put("ok", ok).put("display_id", id).put("package", pkg)
+                                    val r = GemVirtualDisplay.launchOnDisplay(service, pkg, id)
+                                    result.put("ok", r.ok).put("display_id", id).put("package", pkg)
+                                        .put("command", r.command).put("output", r.output)
                                 }
                                 "tap" -> {
                                     val id = body.optInt("display_id", GemVirtualDisplay.currentDisplayId())
@@ -307,6 +328,7 @@ class LocalHttpServer(
                             result.put("shizuku", ShellRunner.isShizuku())
                             result.put("granted", ShellRunner.checkSelfPermission())
                             result.put("running", GemVirtualDisplay.isRunning())
+                            result.put("vd", GemVirtualDisplay.statusJson())
                             writeJson(output, 200, result, keepAlive)
                         }
                         method == "POST" && path == "/agent" -> {

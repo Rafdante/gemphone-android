@@ -64,29 +64,38 @@ object ShellRunner {
     fun run(cmd: String): String = try {
         if (shizukuAvailable) execShizukuOut(cmd) else execRuntimeOut(cmd)
     } catch (e: Exception) {
-        ""
+        // Причину возвращаем текстом, а не пустой строкой: по ней видно, что сломалось
+        // (Shizuku недоступен, newProcess, отказ ActivityManager).
+        val c = e.cause ?: e
+        "ERROR: ${c.javaClass.simpleName}: ${c.message}"
     }
 
-    private fun execShizuku(cmd: String): Boolean {
-        val cls = Class.forName("rikka.shizuku.Shizuku")
-        val newProcess = cls.getMethod(
+    /**
+     * В Shizuku API 13.x метод newProcess не публичный: getMethod() его не находит
+     * (NoSuchMethodException), и любая shell-команда молча возвращала false.
+     * getDeclaredMethod + isAccessible работает и для публичного, и для скрытого варианта.
+     */
+    private fun newProcessMethod(cls: Class<*>): java.lang.reflect.Method {
+        val m = cls.getDeclaredMethod(
             "newProcess",
             Array<String>::class.java,
             Array<String>::class.java,
             String::class.java,
         )
+        m.isAccessible = true
+        return m
+    }
+
+    private fun execShizuku(cmd: String): Boolean {
+        val cls = Class.forName("rikka.shizuku.Shizuku")
+        val newProcess = newProcessMethod(cls)
         val proc = newProcess.invoke(null, arrayOf("sh", "-c", cmd), null, null) as Process
         return proc.waitFor() == 0
     }
 
     private fun execShizukuOut(cmd: String): String {
         val cls = Class.forName("rikka.shizuku.Shizuku")
-        val newProcess = cls.getMethod(
-            "newProcess",
-            Array<String>::class.java,
-            Array<String>::class.java,
-            String::class.java,
-        )
+        val newProcess = newProcessMethod(cls)
         val proc = newProcess.invoke(null, arrayOf("sh", "-c", cmd), null, null) as Process
         val out = proc.inputStream.bufferedReader().readText()
         proc.waitFor()
